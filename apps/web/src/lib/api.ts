@@ -1244,3 +1244,32 @@ export async function deleteImportBatch(batchId: string): Promise<any> {
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
+
+/* ===== Unified Search (Phase 7b) ===== */
+
+export async function searchAll(params: {
+  query: string;
+  source?: 'imported' | 'native';
+  platform?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  role?: string;
+  model?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<{ results: any[]; total: number; queryTimeMs: number }> {
+  const urlParams = new URLSearchParams();
+  urlParams.set('q', params.query);
+  if (params.source) urlParams.set('source', params.source);
+  if (params.platform) urlParams.set('platform', params.platform);
+  if (params.dateFrom) urlParams.set('dateFrom', params.dateFrom);
+  if (params.dateTo) urlParams.set('dateTo', params.dateTo);
+  if (params.role) urlParams.set('role', params.role);
+  if (params.model) urlParams.set('model', params.model);
+  if (params.limit) urlParams.set('limit', String(params.limit));
+  if (params.offset) urlParams.set('offset', String(params.offset));
+
+  const res = await fetch(`${API_BASE}/api/search?${urlParams}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
