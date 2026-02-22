@@ -37,7 +37,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'Invalid platform. Must be: chatgpt, claude, or gemini' });
     }
 
-    const result = await importService.importFile(req.file.path, platform);
+    const result = await importService.importFile(req.file.path, platform, req.file.originalname);
     res.json(result);
   } catch (err: any) {
     console.error('[import] Upload error:', err);

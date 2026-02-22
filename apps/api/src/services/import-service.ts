@@ -12,7 +12,7 @@ export class ImportService {
    * @param filePath - Path to the uploaded file (ZIP or JSON)
    * @param platform - Which platform this file is from
    */
-  async importFile(filePath: string, platform: ImportPlatform): Promise<ImportProgress> {
+  async importFile(filePath: string, platform: ImportPlatform, originalFilename?: string): Promise<ImportProgress> {
     const batchId = uuid();
     const progress: ImportProgress = {
       batchId,
@@ -25,7 +25,7 @@ export class ImportService {
 
     try {
       // 1. Extract data from file
-      const rawData = await this.extractData(filePath, platform);
+      const rawData = await this.extractData(filePath, platform, originalFilename);
 
       // 2. Parse
       const parser = getParser(platform);
@@ -87,8 +87,11 @@ export class ImportService {
     return progress;
   }
 
-  private async extractData(filePath: string, _platform: ImportPlatform): Promise<any[]> {
-    const ext = path.extname(filePath).toLowerCase();
+  private async extractData(filePath: string, _platform: ImportPlatform, originalFilename?: string): Promise<any[]> {
+    // Use original filename extension if available (multer strips extensions)
+    const ext = originalFilename
+      ? path.extname(originalFilename).toLowerCase()
+      : path.extname(filePath).toLowerCase();
 
     if (ext === '.json') {
       const raw = fs.readFileSync(filePath, 'utf-8');
