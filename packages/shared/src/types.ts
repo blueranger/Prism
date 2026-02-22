@@ -553,3 +553,41 @@ export interface ImportProgress {
   totalMessages: number;
   error?: string;
 }
+
+/* ===== Phase 7b: Unified Search ===== */
+
+export type SearchResultSource = 'imported' | 'native';
+
+export interface SearchResult {
+  id: string;
+  conversationId: string;
+  conversationTitle: string;
+  source: SearchResultSource;
+  sourcePlatform?: ImportPlatform;
+  role: MessageRole;
+  content: string;
+  snippet: string;
+  sourceModel?: string;
+  timestamp: string;
+  rank: number;
+}
+
+export interface SearchQuery {
+  query: string;
+  filters?: {
+    source?: SearchResultSource;
+    platform?: ImportPlatform;
+    dateFrom?: string;
+    dateTo?: string;
+    role?: MessageRole;
+    model?: string;
+  };
+  limit?: number;
+  offset?: number;
+}
+
+export interface SearchResponse {
+  results: SearchResult[];
+  total: number;
+  queryTimeMs: number;
+}
