@@ -2,8 +2,9 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { useChatStore } from '@/stores/chat-store';
+import { searchAll } from '@/lib/api';
 import ImportDialog from './ImportDialog';
-import type { ImportPlatform } from '@prism/shared';
+import type { ImportPlatform, SearchResult } from '@prism/shared';
 
 const PLATFORM_TABS: { id: string; label: string }[] = [
   { id: 'all', label: 'All' },
@@ -25,6 +26,8 @@ export default function LibraryView() {
   const [importOpen, setImportOpen] = useState(false);
   const [searchInput, setSearchInput] = useState('');
   const [activeTab, setActiveTab] = useState('all');
+  const [ftsResults, setFtsResults] = useState<SearchResult[]>([]);
+  const [ftsSearching, setFtsSearching] = useState(false);
 
   const conversations = useChatStore((s) => s.libraryConversations);
   const total = useChatStore((s) => s.libraryTotal);
@@ -48,13 +51,27 @@ export default function LibraryView() {
     fetchLibrary({ platform: tab === 'all' ? undefined : tab });
   }, [fetchLibrary]);
 
-  // Search
-  const handleSearch = useCallback(() => {
-    fetchLibrary({
-      platform: activeTab === 'all' ? undefined : activeTab,
-      search: searchInput || undefined,
-    });
-  }, [fetchLibrary, activeTab, searchInput]);
+  // Search — use FTS API for content search, fall back to title filter for empty query
+  const handleSearch = useCallback(async () => {
+    if (!searchInput.trim()) {
+      setFtsResults([]);
+      fetchLibrary({ platform: activeTab === 'all' ? undefined : activeTab });
+      return;
+    }
+    setFtsSearching(true);
+    try {
+      const result = await searchAll({
+        query: searchInput,
+        source: 'imported',
+        platform: activeTab === 'all' ? undefined : activeTab,
+      });
+      setFtsResults(result.results);
+    } catch (err) {
+      console.error('[library] FTS search error:', err);
+    } finally {
+      setFtsSearching(false);
+    }
+  }, [searchInput, activeTab, fetchLibrary]);
 
   // Load more
   const handleLoadMore = useCallback(() => {
@@ -122,9 +139,32 @@ export default function LibraryView() {
           </button>
         </div>
 
-        {/* Conversation list */}
+        {/* Conversation list / FTS results */}
         <div className="flex-1 overflow-y-auto space-y-1">
-          {loading && conversations.length === 0 ? (
+          {ftsSearching ? (
+            <p className="text-xs text-gray-600 text-center py-4">Searching...</p>
+          ) : searchInput.trim() && ftsResults.length > 0 ? (
+            /* FTS search results */
+            ftsResults.map((result) => (
+              <button
+                key={result.id}
+                onClick={() => selectConversation(result.conversationId)}
+                className={`w-full text-left px-3 py-2 rounded-lg transition-colors ${
+                  selectedId === result.conversationId
+                    ? 'bg-gray-700 border border-gray-600'
+                    : 'hover:bg-gray-800/50 border border-transparent'
+                }`}
+              >
+                <div className="flex items-center gap-2 mb-0.5">
+                  {result.sourcePlatform && platformBadge(result.sourcePlatform)}
+                  <span className="text-xs text-gray-300 truncate flex-1">{result.conversationTitle}</span>
+                </div>
+                <p className="text-[10px] text-gray-500 truncate">{result.snippet}</p>
+              </button>
+            ))
+          ) : searchInput.trim() && ftsResults.length === 0 ? (
+            <p className="text-xs text-gray-600 text-center py-4">No results found</p>
+          ) : loading && conversations.length === 0 ? (
             <p className="text-xs text-gray-600 text-center py-4">Loading...</p>
           ) : conversations.length === 0 ? (
             <div className="text-center py-8">
