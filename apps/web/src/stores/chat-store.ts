@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { OperationMode, TimelineEntry, AgentTask, FlowGraph, FlowNode, Session, SessionLink, ExternalThread, ExternalMessage, DraftReply, MonitorRule, ConnectorStatus, CommNotification, ImportedConversation, ImportedMessage, ImportPlatform, ImportProgress } from '@prism/shared';
+import type { OperationMode, TimelineEntry, AgentTask, FlowGraph, FlowNode, Session, SessionLink, ExternalThread, ExternalMessage, DraftReply, MonitorRule, ConnectorStatus, CommNotification, ImportedConversation, ImportedMessage, ImportPlatform, ImportProgress, SearchResult } from '@prism/shared';
 
 export interface ModelResponse {
   model: string;
@@ -82,6 +82,19 @@ interface ChatState {
   libraryImporting: boolean;
   libraryStats: { total: number; byPlatform: Record<string, number> } | null;
 
+  // Search state (Phase 7b)
+  searchQuery: string;
+  searchResults: SearchResult[];
+  searchTotal: number;
+  searchTimeMs: number;
+  searchLoading: boolean;
+  searchFilters: {
+    source?: 'imported' | 'native';
+    platform?: ImportPlatform;
+    dateFrom?: string;
+    dateTo?: string;
+  };
+
   setMode: (mode: OperationMode) => void;
   toggleModel: (model: string) => void;
   setSelectedModels: (models: string[]) => void;
@@ -149,6 +162,13 @@ interface ChatState {
   fetchLibraryStats: () => Promise<void>;
   setLibraryFilter: (filter: { platform?: string; search?: string }) => void;
   setLibraryImporting: (importing: boolean) => void;
+
+  // Search (Phase 7b)
+  setSearchQuery: (q: string) => void;
+  setSearchFilters: (filters: ChatState['searchFilters']) => void;
+  performSearch: () => Promise<void>;
+  clearSearch: () => void;
+  navigateToSearchResult: (result: SearchResult) => void;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -203,6 +223,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
   libraryLoading: false,
   libraryImporting: false,
   libraryStats: null,
+
+  // Search
+  searchQuery: '',
+  searchResults: [],
+  searchTotal: 0,
+  searchTimeMs: 0,
+  searchLoading: false,
+  searchFilters: {},
 
   setMode: (mode) => set({ mode, responses: {} }),
 
@@ -477,4 +505,52 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setLibraryFilter: (filter) => set({ libraryFilter: filter }),
   setLibraryImporting: (importing) => set({ libraryImporting: importing }),
+
+  // Search actions
+  setSearchQuery: (q) => set({ searchQuery: q }),
+  setSearchFilters: (filters) => set({ searchFilters: filters }),
+
+  performSearch: async () => {
+    const { searchQuery, searchFilters } = get();
+    if (!searchQuery.trim()) return;
+    set({ searchLoading: true });
+    try {
+      const { searchAll } = await import('@/lib/api');
+      const result = await searchAll({
+        query: searchQuery,
+        source: searchFilters.source,
+        platform: searchFilters.platform,
+        dateFrom: searchFilters.dateFrom,
+        dateTo: searchFilters.dateTo,
+      });
+      set({
+        searchResults: result.results,
+        searchTotal: result.total,
+        searchTimeMs: result.queryTimeMs,
+      });
+    } catch (err) {
+      console.error('[search] error:', err);
+    } finally {
+      set({ searchLoading: false });
+    }
+  },
+
+  clearSearch: () => set({
+    searchQuery: '',
+    searchResults: [],
+    searchTotal: 0,
+    searchTimeMs: 0,
+    searchFilters: {},
+  }),
+
+  navigateToSearchResult: (result) => {
+    if (result.source === 'imported') {
+      set({ mode: 'library' });
+      get().selectLibraryConversation(result.conversationId);
+    } else {
+      set({ mode: 'parallel' });
+      get().switchSession(result.conversationId);
+    }
+    get().clearSearch();
+  },
 }));
