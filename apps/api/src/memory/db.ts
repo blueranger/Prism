@@ -280,7 +280,37 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_imported_conversations_batch ON imported_conversations(import_batch_id);
     CREATE INDEX IF NOT EXISTS idx_imported_conversations_created ON imported_conversations(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_imported_messages_conversation ON imported_messages(conversation_id, timestamp);
+
+    -- Phase 7b: FTS5 full-text search indexes
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS imported_messages_fts USING fts5(
+      content,
+      content=imported_messages,
+      content_rowid=rowid,
+      tokenize='unicode61'
+    );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS imported_conversations_fts USING fts5(
+      title,
+      content=imported_conversations,
+      content_rowid=rowid,
+      tokenize='unicode61'
+    );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+      content,
+      content=messages,
+      content_rowid=rowid,
+      tokenize='unicode61'
+    );
   `);
+
+  // FTS sync triggers (created separately since CREATE TRIGGER IF NOT EXISTS
+  // inside a big db.exec can fail if some triggers already exist)
+  createFtsTriggers(db);
+
+  // Backfill FTS indexes from existing data
+  backfillFts(db);
 
   // Migrate existing tables if columns are missing
   migrateMessages(db);
@@ -296,6 +326,84 @@ function initSchema(db: Database.Database): void {
 
   // Triage agent migration
   migrateTriageAgent(db);
+}
+
+/**
+ * Create FTS5 sync triggers (idempotent — each trigger is created individually).
+ */
+function createFtsTriggers(db: Database.Database): void {
+  const triggers = [
+    // imported_messages_fts
+    `CREATE TRIGGER IF NOT EXISTS imported_messages_ai AFTER INSERT ON imported_messages BEGIN
+      INSERT INTO imported_messages_fts(rowid, content) VALUES (new.rowid, new.content);
+    END`,
+    `CREATE TRIGGER IF NOT EXISTS imported_messages_ad AFTER DELETE ON imported_messages BEGIN
+      INSERT INTO imported_messages_fts(imported_messages_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+    END`,
+    `CREATE TRIGGER IF NOT EXISTS imported_messages_au AFTER UPDATE ON imported_messages BEGIN
+      INSERT INTO imported_messages_fts(imported_messages_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+      INSERT INTO imported_messages_fts(rowid, content) VALUES (new.rowid, new.content);
+    END`,
+    // imported_conversations_fts
+    `CREATE TRIGGER IF NOT EXISTS imported_conversations_ai AFTER INSERT ON imported_conversations BEGIN
+      INSERT INTO imported_conversations_fts(rowid, title) VALUES (new.rowid, new.title);
+    END`,
+    `CREATE TRIGGER IF NOT EXISTS imported_conversations_ad AFTER DELETE ON imported_conversations BEGIN
+      INSERT INTO imported_conversations_fts(imported_conversations_fts, rowid, title) VALUES('delete', old.rowid, old.title);
+    END`,
+    `CREATE TRIGGER IF NOT EXISTS imported_conversations_au AFTER UPDATE ON imported_conversations BEGIN
+      INSERT INTO imported_conversations_fts(imported_conversations_fts, rowid, title) VALUES('delete', old.rowid, old.title);
+      INSERT INTO imported_conversations_fts(rowid, title) VALUES (new.rowid, new.title);
+    END`,
+    // messages_fts
+    `CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+      INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+    END`,
+    `CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+    END`,
+    `CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+      INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+      INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
+    END`,
+  ];
+
+  for (const sql of triggers) {
+    try { db.exec(sql); } catch {}
+  }
+}
+
+/**
+ * Backfill FTS indexes from existing data (safe to run multiple times).
+ */
+function backfillFts(db: Database.Database): void {
+  try {
+    const importedMsgCount = (db.prepare('SELECT COUNT(*) as c FROM imported_messages').get() as any).c;
+    const ftsCount = (db.prepare('SELECT COUNT(*) as c FROM imported_messages_fts').get() as any).c;
+    if (importedMsgCount > 0 && ftsCount === 0) {
+      console.log('[db] Backfilling imported_messages_fts...');
+      db.exec('INSERT INTO imported_messages_fts(rowid, content) SELECT rowid, content FROM imported_messages');
+      console.log(`[db] Backfilled ${importedMsgCount} imported messages into FTS`);
+    }
+
+    const importedConvCount = (db.prepare('SELECT COUNT(*) as c FROM imported_conversations').get() as any).c;
+    const convFtsCount = (db.prepare('SELECT COUNT(*) as c FROM imported_conversations_fts').get() as any).c;
+    if (importedConvCount > 0 && convFtsCount === 0) {
+      console.log('[db] Backfilling imported_conversations_fts...');
+      db.exec('INSERT INTO imported_conversations_fts(rowid, title) SELECT rowid, title FROM imported_conversations');
+      console.log(`[db] Backfilled ${importedConvCount} imported conversations into FTS`);
+    }
+
+    const msgCount = (db.prepare('SELECT COUNT(*) as c FROM messages').get() as any).c;
+    const msgFtsCount = (db.prepare('SELECT COUNT(*) as c FROM messages_fts').get() as any).c;
+    if (msgCount > 0 && msgFtsCount === 0) {
+      console.log('[db] Backfilling messages_fts...');
+      db.exec('INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages');
+      console.log(`[db] Backfilled ${msgCount} messages into FTS`);
+    }
+  } catch (err) {
+    console.warn('[db] FTS backfill warning:', err);
+  }
 }
 
 function migrateMessages(db: Database.Database): void {
