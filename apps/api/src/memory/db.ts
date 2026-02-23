@@ -374,32 +374,26 @@ function createFtsTriggers(db: Database.Database): void {
 }
 
 /**
- * Backfill FTS indexes from existing data (safe to run multiple times).
+ * Backfill FTS indexes from existing data using 'rebuild' command.
+ * For content-sync'd FTS5 tables, 'rebuild' re-reads the content table
+ * and rebuilds the full-text index — this is the correct way to backfill.
+ * Safe to run multiple times (rebuild is idempotent).
  */
 function backfillFts(db: Database.Database): void {
   try {
     const importedMsgCount = (db.prepare('SELECT COUNT(*) as c FROM imported_messages').get() as any).c;
-    const ftsCount = (db.prepare('SELECT COUNT(*) as c FROM imported_messages_fts').get() as any).c;
-    if (importedMsgCount > 0 && ftsCount === 0) {
-      console.log('[db] Backfilling imported_messages_fts...');
-      db.exec('INSERT INTO imported_messages_fts(rowid, content) SELECT rowid, content FROM imported_messages');
-      console.log(`[db] Backfilled ${importedMsgCount} imported messages into FTS`);
+    if (importedMsgCount > 0) {
+      db.exec("INSERT INTO imported_messages_fts(imported_messages_fts) VALUES('rebuild')");
     }
 
     const importedConvCount = (db.prepare('SELECT COUNT(*) as c FROM imported_conversations').get() as any).c;
-    const convFtsCount = (db.prepare('SELECT COUNT(*) as c FROM imported_conversations_fts').get() as any).c;
-    if (importedConvCount > 0 && convFtsCount === 0) {
-      console.log('[db] Backfilling imported_conversations_fts...');
-      db.exec('INSERT INTO imported_conversations_fts(rowid, title) SELECT rowid, title FROM imported_conversations');
-      console.log(`[db] Backfilled ${importedConvCount} imported conversations into FTS`);
+    if (importedConvCount > 0) {
+      db.exec("INSERT INTO imported_conversations_fts(imported_conversations_fts) VALUES('rebuild')");
     }
 
     const msgCount = (db.prepare('SELECT COUNT(*) as c FROM messages').get() as any).c;
-    const msgFtsCount = (db.prepare('SELECT COUNT(*) as c FROM messages_fts').get() as any).c;
-    if (msgCount > 0 && msgFtsCount === 0) {
-      console.log('[db] Backfilling messages_fts...');
-      db.exec('INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages');
-      console.log(`[db] Backfilled ${msgCount} messages into FTS`);
+    if (msgCount > 0) {
+      db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
     }
   } catch (err) {
     console.warn('[db] FTS backfill warning:', err);
