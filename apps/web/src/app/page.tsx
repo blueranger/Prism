@@ -20,6 +20,7 @@ import LinkedSessionsBadge from '@/components/LinkedSessionsBadge';
 import CommunicationView from '@/components/CommunicationView';
 import CommNotificationBadge from '@/components/CommNotificationBadge';
 import LibraryView from '@/components/LibraryView';
+import KnowledgeView from '@/components/KnowledgeView';
 import SearchBar from '@/components/SearchBar';
 import SearchResults from '@/components/SearchResults';
 
@@ -84,7 +85,7 @@ export default function Home() {
         ) : (
           <>
             {/* Timeline sidebar (shows when there's history, hidden in flow/communication mode) */}
-            {showTimeline && mode !== 'flow' && mode !== 'communication' && mode !== 'library' && (
+            {showTimeline && mode !== 'flow' && mode !== 'communication' && mode !== 'library' && mode !== 'knowledge' && (
               <div className="w-80 flex-shrink-0 flex flex-col border-r border-gray-800 pr-4">
                 <h2 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">
                   Timeline
@@ -103,6 +104,7 @@ export default function Home() {
               {mode === 'flow' && <FlowVisualizer />}
               {mode === 'communication' && <CommunicationView />}
               {mode === 'library' && <LibraryView />}
+              {mode === 'knowledge' && <KnowledgeView />}
             </div>
           </>
         )}

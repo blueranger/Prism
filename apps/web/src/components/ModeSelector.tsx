@@ -12,6 +12,7 @@ const MODES: { id: OperationMode; label: string; description: string }[] = [
   { id: 'flow', label: 'Flow', description: 'Visualize cross-model conversation flow' },
   { id: 'communication', label: 'Comms', description: 'Monitor and reply to external messages' },
   { id: 'library', label: 'Library', description: 'Browse imported conversation archives' },
+  { id: 'knowledge', label: 'Knowledge', description: 'Explore knowledge graph from conversations' },
 ];
 
 export default function ModeSelector() {
