@@ -1273,3 +1273,79 @@ export async function searchAll(params: {
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
+
+/* ===== Knowledge Graph (Phase 7c) ===== */
+
+export async function triggerExtraction(provider?: string, model?: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/knowledge/extract`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, model }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function triggerNativeExtraction(provider?: string, model?: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/knowledge/extract/native`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider, model }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchExtractionProgress(): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/knowledge/extract/progress`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchTags(search?: string): Promise<any[]> {
+  const params = new URLSearchParams();
+  if (search) params.set('search', search);
+  const res = await fetch(`${API_BASE}/api/knowledge/tags?${params}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchTagConversations(tagId: string): Promise<any[]> {
+  const res = await fetch(`${API_BASE}/api/knowledge/tags/${tagId}/conversations`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchEntities(opts?: { type?: string; search?: string; limit?: number; offset?: number }): Promise<any> {
+  const params = new URLSearchParams();
+  if (opts?.type) params.set('type', opts.type);
+  if (opts?.search) params.set('search', opts.search);
+  if (opts?.limit) params.set('limit', String(opts.limit));
+  if (opts?.offset) params.set('offset', String(opts.offset));
+  const res = await fetch(`${API_BASE}/api/knowledge/entities?${params}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchEntityDetail(entityId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/knowledge/entities/${entityId}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchGraphData(opts?: { type?: string; minMentions?: number; center?: string; maxNodes?: number }): Promise<any> {
+  const params = new URLSearchParams();
+  if (opts?.type) params.set('type', opts.type);
+  if (opts?.minMentions) params.set('minMentions', String(opts.minMentions));
+  if (opts?.center) params.set('center', opts.center);
+  if (opts?.maxNodes) params.set('maxNodes', String(opts.maxNodes));
+  const res = await fetch(`${API_BASE}/api/knowledge/graph?${params}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchKnowledgeStats(): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/knowledge/stats`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
