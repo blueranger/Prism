@@ -24,6 +24,7 @@ import commRouter from './routes/comm';
 import webhooksRouter from './routes/webhooks';
 import importRouter from './routes/import';
 import searchRouter from './routes/search';
+import knowledgeRouter from './routes/knowledge';
 
 // Import agents to trigger self-registration
 import './agents';
@@ -69,6 +70,7 @@ app.use('/api/comm', commRouter);
 app.use('/api/webhooks', webhooksRouter);
 app.use('/api/import', importRouter);
 app.use('/api/search', searchRouter);
+app.use('/api/knowledge', knowledgeRouter);
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
