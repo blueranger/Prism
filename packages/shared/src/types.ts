@@ -2,7 +2,7 @@ export type LLMProvider = 'openai' | 'anthropic' | 'google';
 
 export type MessageRole = 'user' | 'assistant' | 'system';
 
-export type OperationMode = 'parallel' | 'handoff' | 'compare' | 'synthesize' | 'agents' | 'flow' | 'communication' | 'library';
+export type OperationMode = 'parallel' | 'handoff' | 'compare' | 'synthesize' | 'agents' | 'flow' | 'communication' | 'library' | 'knowledge';
 
 export interface Message {
   id: string;
@@ -590,4 +590,77 @@ export interface SearchResponse {
   results: SearchResult[];
   total: number;
   queryTimeMs: number;
+}
+
+/* ===== Phase 7c: Knowledge Graph ===== */
+
+export type EntityType = 'technology' | 'concept' | 'person' | 'project' | 'organization' | 'topic';
+export type RelationType = 'related_to' | 'part_of' | 'depends_on' | 'alternative_to' | 'used_with';
+
+export interface Tag {
+  id: string;
+  name: string;
+  color?: string;
+  createdAt: string;
+  source: 'auto' | 'manual';
+  conversationCount?: number;
+}
+
+export interface KnowledgeEntity {
+  id: string;
+  name: string;
+  entityType: EntityType;
+  description?: string;
+  aliases?: string[];
+  firstSeenAt?: string;
+  mentionCount: number;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface EntityRelation {
+  id: string;
+  sourceEntityId: string;
+  targetEntityId: string;
+  relationType: RelationType;
+  weight: number;
+  createdAt: string;
+}
+
+export interface EntityMention {
+  entityId: string;
+  conversationId?: string;
+  sessionId?: string;
+  conversationTitle?: string;
+  mentionCount: number;
+  contextSnippet?: string;
+}
+
+export interface KnowledgeGraphNode {
+  id: string;
+  label: string;
+  type: EntityType;
+  size: number;
+  color: string;
+}
+
+export interface KnowledgeGraphEdge {
+  source: string;
+  target: string;
+  label: RelationType;
+  weight: number;
+}
+
+export interface KnowledgeGraphData {
+  nodes: KnowledgeGraphNode[];
+  edges: KnowledgeGraphEdge[];
+}
+
+export interface ExtractionProgress {
+  status: 'idle' | 'running' | 'completed' | 'failed';
+  totalConversations: number;
+  processedConversations: number;
+  entitiesFound: number;
+  relationsFound: number;
+  error?: string;
 }
