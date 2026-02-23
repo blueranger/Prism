@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { OperationMode, TimelineEntry, AgentTask, FlowGraph, FlowNode, Session, SessionLink, ExternalThread, ExternalMessage, DraftReply, MonitorRule, ConnectorStatus, CommNotification, ImportedConversation, ImportedMessage, ImportPlatform, ImportProgress, SearchResult } from '@prism/shared';
+import type { OperationMode, TimelineEntry, AgentTask, FlowGraph, FlowNode, Session, SessionLink, ExternalThread, ExternalMessage, DraftReply, MonitorRule, ConnectorStatus, CommNotification, ImportedConversation, ImportedMessage, ImportPlatform, ImportProgress, SearchResult, KnowledgeGraphData, KnowledgeEntity, Tag, ExtractionProgress } from '@prism/shared';
 
 export interface ModelResponse {
   model: string;
@@ -95,6 +95,16 @@ interface ChatState {
     dateTo?: string;
   };
 
+  // Knowledge Graph state (Phase 7c)
+  knowledgeGraphData: KnowledgeGraphData | null;
+  knowledgeEntities: KnowledgeEntity[];
+  knowledgeTags: Tag[];
+  knowledgeStats: any;
+  knowledgeSelectedEntity: string | null;
+  knowledgeEntityDetail: any;
+  knowledgeExtractionProgress: ExtractionProgress | null;
+  knowledgeLoading: boolean;
+
   setMode: (mode: OperationMode) => void;
   toggleModel: (model: string) => void;
   setSelectedModels: (models: string[]) => void;
@@ -169,6 +179,15 @@ interface ChatState {
   performSearch: () => Promise<void>;
   clearSearch: () => void;
   navigateToSearchResult: (result: SearchResult) => void;
+
+  // Knowledge Graph (Phase 7c)
+  fetchKnowledgeGraph: (opts?: any) => Promise<void>;
+  fetchKnowledgeEntities: (opts?: any) => Promise<void>;
+  fetchKnowledgeTags: (search?: string) => Promise<void>;
+  selectKnowledgeEntity: (id: string) => Promise<void>;
+  triggerKnowledgeExtraction: (provider?: string, model?: string) => Promise<void>;
+  pollExtractionProgress: () => Promise<void>;
+  fetchKnowledgeStatsAction: () => Promise<void>;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -231,6 +250,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
   searchTimeMs: 0,
   searchLoading: false,
   searchFilters: {},
+
+  // Knowledge Graph
+  knowledgeGraphData: null,
+  knowledgeEntities: [],
+  knowledgeTags: [],
+  knowledgeStats: null,
+  knowledgeSelectedEntity: null,
+  knowledgeEntityDetail: null,
+  knowledgeExtractionProgress: null,
+  knowledgeLoading: false,
 
   setMode: (mode) => set({ mode, responses: {} }),
 
@@ -552,5 +581,80 @@ export const useChatStore = create<ChatState>((set, get) => ({
       get().switchSession(result.conversationId);
     }
     get().clearSearch();
+  },
+
+  // Knowledge Graph actions
+  fetchKnowledgeGraph: async (opts) => {
+    set({ knowledgeLoading: true });
+    try {
+      const { fetchGraphData } = await import('@/lib/api');
+      const data = await fetchGraphData(opts);
+      set({ knowledgeGraphData: data });
+    } catch (err) {
+      console.error('[knowledge] graph fetch error:', err);
+    } finally {
+      set({ knowledgeLoading: false });
+    }
+  },
+
+  fetchKnowledgeEntities: async (opts) => {
+    try {
+      const { fetchEntities } = await import('@/lib/api');
+      const result = await fetchEntities(opts);
+      set({ knowledgeEntities: result.entities });
+    } catch (err) {
+      console.error('[knowledge] entities fetch error:', err);
+    }
+  },
+
+  fetchKnowledgeTags: async (search) => {
+    try {
+      const { fetchTags } = await import('@/lib/api');
+      const tags = await fetchTags(search);
+      set({ knowledgeTags: tags });
+    } catch (err) {
+      console.error('[knowledge] tags fetch error:', err);
+    }
+  },
+
+  selectKnowledgeEntity: async (id) => {
+    set({ knowledgeSelectedEntity: id });
+    try {
+      const { fetchEntityDetail } = await import('@/lib/api');
+      const detail = await fetchEntityDetail(id);
+      set({ knowledgeEntityDetail: detail });
+    } catch (err) {
+      console.error('[knowledge] entity detail error:', err);
+    }
+  },
+
+  triggerKnowledgeExtraction: async (provider, model) => {
+    try {
+      const { triggerExtraction } = await import('@/lib/api');
+      await triggerExtraction(provider, model);
+      set({ knowledgeExtractionProgress: { status: 'running', totalConversations: 0, processedConversations: 0, entitiesFound: 0, relationsFound: 0 } });
+    } catch (err) {
+      console.error('[knowledge] extraction trigger error:', err);
+    }
+  },
+
+  pollExtractionProgress: async () => {
+    try {
+      const { fetchExtractionProgress } = await import('@/lib/api');
+      const progress = await fetchExtractionProgress();
+      set({ knowledgeExtractionProgress: progress });
+    } catch (err) {
+      console.error('[knowledge] progress poll error:', err);
+    }
+  },
+
+  fetchKnowledgeStatsAction: async () => {
+    try {
+      const { fetchKnowledgeStats } = await import('@/lib/api');
+      const stats = await fetchKnowledgeStats();
+      set({ knowledgeStats: stats });
+    } catch (err) {
+      console.error('[knowledge] stats fetch error:', err);
+    }
   },
 }));
