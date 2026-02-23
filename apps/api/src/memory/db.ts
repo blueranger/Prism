@@ -303,6 +303,79 @@ function initSchema(db: Database.Database): void {
       content_rowid=rowid,
       tokenize='unicode61'
     );
+
+    -- Phase 7c: Knowledge Graph tables
+
+    CREATE TABLE IF NOT EXISTS tags (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      color TEXT,
+      created_at TEXT NOT NULL,
+      source TEXT DEFAULT 'auto'
+    );
+
+    CREATE TABLE IF NOT EXISTS conversation_tags (
+      tag_id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      confidence REAL DEFAULT 1.0,
+      PRIMARY KEY (tag_id, conversation_id),
+      FOREIGN KEY (tag_id) REFERENCES tags(id),
+      FOREIGN KEY (conversation_id) REFERENCES imported_conversations(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS session_tags (
+      tag_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      confidence REAL DEFAULT 1.0,
+      PRIMARY KEY (tag_id, session_id),
+      FOREIGN KEY (tag_id) REFERENCES tags(id),
+      FOREIGN KEY (session_id) REFERENCES sessions(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS knowledge_entities (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      description TEXT,
+      aliases TEXT,
+      first_seen_at TEXT,
+      mention_count INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS entity_mentions (
+      entity_id TEXT NOT NULL,
+      conversation_id TEXT,
+      session_id TEXT,
+      mention_count INTEGER DEFAULT 1,
+      context_snippet TEXT,
+      PRIMARY KEY (entity_id, COALESCE(conversation_id, ''), COALESCE(session_id, '')),
+      FOREIGN KEY (entity_id) REFERENCES knowledge_entities(id),
+      FOREIGN KEY (conversation_id) REFERENCES imported_conversations(id),
+      FOREIGN KEY (session_id) REFERENCES sessions(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS entity_relations (
+      id TEXT PRIMARY KEY,
+      source_entity_id TEXT NOT NULL,
+      target_entity_id TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      weight REAL DEFAULT 1.0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (source_entity_id) REFERENCES knowledge_entities(id),
+      FOREIGN KEY (target_entity_id) REFERENCES knowledge_entities(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_conversation_tags_conv ON conversation_tags(conversation_id);
+    CREATE INDEX IF NOT EXISTS idx_session_tags_session ON session_tags(session_id);
+    CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity_id);
+    CREATE INDEX IF NOT EXISTS idx_entity_mentions_conv ON entity_mentions(conversation_id);
+    CREATE INDEX IF NOT EXISTS idx_entity_mentions_session ON entity_mentions(session_id);
+    CREATE INDEX IF NOT EXISTS idx_entity_relations_source ON entity_relations(source_entity_id);
+    CREATE INDEX IF NOT EXISTS idx_entity_relations_target ON entity_relations(target_entity_id);
+    CREATE INDEX IF NOT EXISTS idx_knowledge_entities_type ON knowledge_entities(entity_type);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_entities_name_type ON knowledge_entities(name, entity_type);
   `);
 
   // FTS sync triggers (created separately since CREATE TRIGGER IF NOT EXISTS
