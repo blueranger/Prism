@@ -1,10 +1,13 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useChatStore } from '@/stores/chat-store';
 import { searchAll } from '@/lib/api';
 import ImportDialog from './ImportDialog';
-import type { ImportPlatform, SearchResult } from '@prism/shared';
+import SessionOutline from './SessionOutline';
+import ConversationKnowledge from './ConversationKnowledge';
+import CopyWithProvenance from './CopyWithProvenance';
+import type { ImportPlatform, SearchResult, OutlineSection } from '@prism/shared';
 
 const PLATFORM_TABS: { id: string; label: string }[] = [
   { id: 'all', label: 'All' },
@@ -28,6 +31,35 @@ export default function LibraryView() {
   const [activeTab, setActiveTab] = useState('all');
   const [ftsResults, setFtsResults] = useState<SearchResult[]>([]);
   const [ftsSearching, setFtsSearching] = useState(false);
+  const [libraryDetailTab, setLibraryDetailTab] = useState<'messages' | 'topics' | 'knowledge'>('messages');
+  const [libraryHighlightRange, setLibraryHighlightRange] = useState<{ start: number; end: number } | null>(null);
+  const libraryMessagesRef = useRef<HTMLDivElement>(null);
+
+  // Resizable left panel width
+  const [leftPanelWidth, setLeftPanelWidth] = useState(320);
+  const lpDragging = useRef(false);
+  const lpDragStartX = useRef(0);
+  const lpDragStartW = useRef(0);
+
+  const handleLeftPanelDragStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    lpDragging.current = true;
+    lpDragStartX.current = e.clientX;
+    lpDragStartW.current = leftPanelWidth;
+
+    const onMove = (ev: MouseEvent) => {
+      if (!lpDragging.current) return;
+      const delta = ev.clientX - lpDragStartX.current;
+      setLeftPanelWidth(Math.max(200, Math.min(500, lpDragStartW.current + delta)));
+    };
+    const onUp = () => {
+      lpDragging.current = false;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, [leftPanelWidth]);
 
   const conversations = useChatStore((s) => s.libraryConversations);
   const total = useChatStore((s) => s.libraryTotal);
@@ -44,6 +76,12 @@ export default function LibraryView() {
     fetchLibrary();
     fetchLibraryStats();
   }, [fetchLibrary, fetchLibraryStats]);
+
+  // Reset detail tab when conversation changes
+  useEffect(() => {
+    setLibraryDetailTab('messages');
+    setLibraryHighlightRange(null);
+  }, [selectedId]);
 
   // Filter by platform tab
   const handleTabChange = useCallback((tab: string) => {
@@ -87,7 +125,7 @@ export default function LibraryView() {
   return (
     <div className="flex-1 flex gap-4 min-h-0">
       {/* Left sidebar: conversation list */}
-      <div className="w-80 flex-shrink-0 flex flex-col min-h-0">
+      <div className="flex-shrink-0 flex flex-col min-h-0" style={{ width: leftPanelWidth }}>
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-semibold text-gray-300">
             Library
@@ -211,8 +249,17 @@ export default function LibraryView() {
         </div>
       </div>
 
+      {/* Horizontal drag handle */}
+      <div
+        onMouseDown={handleLeftPanelDragStart}
+        className="group w-2 flex-shrink-0 flex items-center justify-center cursor-col-resize select-none"
+        title="Drag to resize"
+      >
+        <div className="w-0.5 h-12 rounded-full bg-gray-700 group-hover:bg-indigo-500 transition-colors" />
+      </div>
+
       {/* Right panel: conversation detail */}
-      <div className="flex-1 flex flex-col min-h-0 border-l border-gray-800 pl-4">
+      <div className="flex-1 flex flex-col min-h-0 pl-2">
         {selectedConv ? (
           <>
             <div className="flex items-center gap-2 mb-3">
@@ -223,37 +270,130 @@ export default function LibraryView() {
               </span>
             </div>
 
-            <div className="flex-1 overflow-y-auto space-y-3 pr-2">
-              {messages.length === 0 ? (
-                <p className="text-xs text-gray-600 text-center py-4">Loading messages...</p>
-              ) : (
-                messages.map((msg) => (
-                  <div
-                    key={msg.id}
-                    className={`rounded-lg p-3 text-sm ${
-                      msg.role === 'user'
-                        ? 'bg-gray-800 text-gray-300'
-                        : 'bg-gray-800/50 text-gray-400 border-l-2 border-indigo-600'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="text-[10px] font-medium uppercase text-gray-500">
-                        {msg.role}
-                      </span>
-                      {msg.sourceModel && (
-                        <span className="text-[10px] text-gray-600">{msg.sourceModel}</span>
-                      )}
-                      <span className="text-[10px] text-gray-700">
-                        {new Date(msg.timestamp).toLocaleTimeString()}
-                      </span>
-                    </div>
-                    <div className="whitespace-pre-wrap break-words text-xs leading-relaxed">
-                      {msg.content}
-                    </div>
-                  </div>
-                ))
-              )}
+            {/* Tab switcher */}
+            <div className="flex items-center gap-2 mb-3">
+              <button
+                onClick={() => setLibraryDetailTab('messages')}
+                className={`text-xs font-semibold uppercase tracking-wider transition-colors ${
+                  libraryDetailTab === 'messages' ? 'text-gray-300' : 'text-gray-600 hover:text-gray-400'
+                }`}
+              >
+                Messages
+              </button>
+              <span className="text-gray-700">|</span>
+              <button
+                onClick={() => {
+                  setLibraryDetailTab('topics');
+                  if (selectedId) {
+                    useChatStore.getState().fetchSessionOutline(selectedId, 'imported');
+                  }
+                }}
+                className={`text-xs font-semibold uppercase tracking-wider transition-colors ${
+                  libraryDetailTab === 'topics' ? 'text-gray-300' : 'text-gray-600 hover:text-gray-400'
+                }`}
+              >
+                Topics
+              </button>
+              <span className="text-gray-700">|</span>
+              <button
+                onClick={() => {
+                  setLibraryDetailTab('knowledge');
+                  if (selectedId) {
+                    useChatStore.getState().fetchConversationKnowledge(selectedId, 'imported');
+                  }
+                }}
+                className={`text-xs font-semibold uppercase tracking-wider transition-colors ${
+                  libraryDetailTab === 'knowledge' ? 'text-gray-300' : 'text-gray-600 hover:text-gray-400'
+                }`}
+              >
+                Knowledge
+              </button>
             </div>
+
+            {libraryDetailTab === 'messages' ? (
+              <div ref={libraryMessagesRef} className="flex-1 overflow-y-auto space-y-3 pr-2">
+                {messages.length === 0 ? (
+                  <p className="text-xs text-gray-600 text-center py-4">Loading messages...</p>
+                ) : (
+                  messages.map((msg, idx) => (
+                    <div
+                      key={msg.id}
+                      data-message-index={idx}
+                      className={`rounded-lg p-3 text-sm transition-colors ${
+                        msg.role === 'user'
+                          ? 'bg-gray-800 text-gray-300'
+                          : 'bg-gray-800/50 text-gray-400 border-l-2 border-indigo-600'
+                      } ${
+                        libraryHighlightRange &&
+                        idx >= libraryHighlightRange.start &&
+                        idx <= libraryHighlightRange.end
+                          ? 'ring-1 ring-indigo-500/50'
+                          : ''
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="text-[10px] font-medium uppercase text-gray-500">
+                          {msg.role}
+                        </span>
+                        {msg.sourceModel && (
+                          <span className="text-[10px] text-gray-600">{msg.sourceModel}</span>
+                        )}
+                        <span className="text-[10px] text-gray-700">
+                          {new Date(msg.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <div className="flex items-start gap-2">
+                        <div className="whitespace-pre-wrap break-words text-xs leading-relaxed flex-1">
+                          {msg.content}
+                        </div>
+                        {msg.role === 'assistant' && selectedId && (
+                          <CopyWithProvenance
+                            content={msg.content}
+                            messageId={msg.id}
+                            sourceType="imported"
+                            sourceId={selectedId}
+                            sourceModel={msg.sourceModel || 'unknown'}
+                          />
+                        )}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            ) : libraryDetailTab === 'topics' ? (
+              selectedId ? (
+                <SessionOutline
+                  sessionId={selectedId}
+                  sourceType="imported"
+                  onSectionClick={(section: OutlineSection) => {
+                    setLibraryDetailTab('messages');
+                    setLibraryHighlightRange({
+                      start: section.startMessageIndex,
+                      end: section.endMessageIndex,
+                    });
+                    // Scroll to section after tab switch
+                    setTimeout(() => {
+                      const container = libraryMessagesRef.current;
+                      if (container) {
+                        const targetEl = container.querySelector(
+                          `[data-message-index="${section.startMessageIndex}"]`
+                        );
+                        if (targetEl) {
+                          targetEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                        }
+                      }
+                    }, 100);
+                  }}
+                />
+              ) : null
+            ) : libraryDetailTab === 'knowledge' ? (
+              selectedId ? (
+                <ConversationKnowledge
+                  conversationId={selectedId}
+                  sourceType="imported"
+                />
+              ) : null
+            ) : null}
           </>
         ) : (
           <div className="flex-1 flex items-center justify-center text-gray-600 text-sm">

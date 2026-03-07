@@ -13,6 +13,8 @@ const MODES: { id: OperationMode; label: string; description: string }[] = [
   { id: 'communication', label: 'Comms', description: 'Monitor and reply to external messages' },
   { id: 'library', label: 'Library', description: 'Browse imported conversation archives' },
   { id: 'knowledge', label: 'Knowledge', description: 'Explore knowledge graph from conversations' },
+  { id: 'provenance', label: 'Provenance', description: 'Track & trace AI outputs' },
+  { id: 'rag', label: 'KB', description: 'Search & ask questions across your knowledge base' },
 ];
 
 export default function ModeSelector() {

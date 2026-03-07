@@ -84,7 +84,7 @@ export default function KnowledgeView() {
   }, [fetchEntities, entityFilter, entitySearch]);
 
   const handleRunExtraction = useCallback(() => {
-    triggerExtraction('google', 'gemini-2.0-flash');
+    triggerExtraction('openai', 'gpt-4o-mini');
   }, [triggerExtraction]);
 
   const isExtracting = extractionProgress?.status === 'running';

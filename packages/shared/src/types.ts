@@ -2,7 +2,19 @@ export type LLMProvider = 'openai' | 'anthropic' | 'google';
 
 export type MessageRole = 'user' | 'assistant' | 'system';
 
-export type OperationMode = 'parallel' | 'handoff' | 'compare' | 'synthesize' | 'agents' | 'flow' | 'communication' | 'library' | 'knowledge';
+// --- Thinking / Reasoning Mode ---
+
+export type ReasoningEffort = 'low' | 'medium' | 'high';
+
+export interface ThinkingConfig {
+  enabled: boolean;
+  /** OpenAI reasoning_effort (o-series, GPT-5.x) */
+  effort?: ReasoningEffort;
+  /** Google thinkingBudget (0-24576 tokens) / Anthropic budget_tokens */
+  budgetTokens?: number;
+}
+
+export type OperationMode = 'parallel' | 'handoff' | 'compare' | 'synthesize' | 'agents' | 'flow' | 'communication' | 'library' | 'knowledge' | 'provenance' | 'rag';
 
 export interface Message {
   id: string;
@@ -54,6 +66,8 @@ export interface LLMRequest {
   provider: LLMProvider;
   temperature?: number;
   maxTokens?: number;
+  /** Thinking / reasoning mode configuration */
+  thinking?: ThinkingConfig;
 }
 
 export interface StreamChunk {
@@ -66,6 +80,8 @@ export interface StreamChunk {
     promptTokens?: number;
     completionTokens?: number;
   };
+  /** Thinking / chain-of-thought content (streamed separately from main response) */
+  thinkingContent?: string;
 }
 
 export interface PromptRequest {
@@ -73,6 +89,8 @@ export interface PromptRequest {
   models: string[];
   sessionId?: string;
   mode?: OperationMode;
+  /** Per-model thinking configuration, keyed by model id */
+  thinking?: Record<string, ThinkingConfig>;
 }
 
 export interface ModelConfig {
@@ -80,6 +98,36 @@ export interface ModelConfig {
   model: string;
   displayName: string;
   maxTokens: number;
+  /** USD per 1M input tokens */
+  inputCostPer1M: number;
+  /** USD per 1M output tokens */
+  outputCostPer1M: number;
+  /** Short description / notes about this model */
+  description?: string;
+  /** If true, model uses reasoning tokens (billed as output but invisible in response) */
+  isReasoning?: boolean;
+  /** If true, model supports thinking / extended reasoning mode */
+  supportsThinking?: boolean;
+}
+
+/** Model discovered at runtime via provider API */
+export interface DiscoveredModel {
+  model: string;
+  provider: LLMProvider;
+  displayName: string;
+  maxTokens: number;
+  inputCostPer1M?: number;
+  outputCostPer1M?: number;
+  description?: string;
+  isReasoning?: boolean;
+  discoveredAt: number;
+}
+
+/** Metadata about the model registry state */
+export interface ModelRegistryInfo {
+  staticCount: number;
+  discoveredCount: number;
+  lastRefreshedAt: number | null;
 }
 
 // --- Compare & Synthesize (Phase 3) ---
@@ -116,6 +164,25 @@ export interface Artifact {
   version: number;
   parentVersion?: number | null;
   timestamp: number;
+}
+
+// --- Artifact Provenance (Phase 7d) ---
+
+export interface ProvenanceRecord {
+  id: string;
+  shortCode: string;
+  sourceType: 'native' | 'imported';
+  sessionId: string | null;
+  conversationId: string | null;
+  messageId: string;
+  artifactId: string | null;
+  contentPreview: string;
+  contentHash: string;
+  sourceModel: string;
+  entities: string[] | null;
+  tags: string[] | null;
+  copiedAt: number;
+  note: string | null;
 }
 
 // --- Agent Layer (Phase 4) ---
@@ -285,9 +352,9 @@ export interface ClassificationResult {
 
 // --- Communication Tools Integration (Phase 6) ---
 
-export type CommProvider = 'outlook' | 'teams' | 'line';
+export type CommProvider = 'outlook' | 'teams' | 'line' | 'notion' | 'manual';
 
-export type ConnectorType = 'outlook-oauth' | 'outlook-local' | 'teams' | 'line';
+export type ConnectorType = 'outlook-oauth' | 'outlook-local' | 'teams' | 'line' | 'notion-oauth' | 'notion-internal' | 'manual';
 
 export type DraftStatus = 'pending' | 'approved' | 'sent' | 'rejected';
 
@@ -636,6 +703,15 @@ export interface EntityMention {
   contextSnippet?: string;
 }
 
+/** Scenario 1: Knowledge hint match for contextual suggestions while typing */
+export interface KnowledgeHintMatch {
+  entity: KnowledgeEntity;
+  mentions: EntityMention[];
+  totalConversations: number;
+  /** The keyword from the user's prompt that triggered this entity match */
+  matchedKeyword?: string;
+}
+
 export interface KnowledgeGraphNode {
   id: string;
   label: string;
@@ -663,4 +739,154 @@ export interface ExtractionProgress {
   entitiesFound: number;
   relationsFound: number;
   error?: string;
+}
+
+/* ===== Session Outline / Topic Navigation ===== */
+
+export interface OutlineSection {
+  id: string;
+  title: string;
+  description?: string;
+  startMessageIndex: number;
+  endMessageIndex: number;
+  messageCount: number;
+  keyEntities?: string[];
+}
+
+export interface SessionOutline {
+  id: string;
+  sessionId: string;
+  sourceType: 'native' | 'imported';
+  sections: OutlineSection[];
+  generatedAt: string;
+  modelUsed: string;
+  version: number;
+}
+
+// --- Notion Integration (Scenario 4) ---
+
+export interface NotionPageRef {
+  id: string;
+  notionPageId: string;
+  title: string;
+  url: string;
+  lastEditedAt: number;
+  parentType: 'workspace' | 'database' | 'page';
+  parentId: string | null;
+  iconEmoji: string | null;
+  contentMd: string | null;
+  contentHash: string | null;
+  syncedAt: number;
+}
+
+export interface ContextSource {
+  id: string;
+  sessionId: string;
+  sourceType: 'notion_page' | 'uploaded_file';
+  sourceId: string;
+  sourceLabel: string;
+  attachedAt: number;
+  attachedBy: 'user' | 'auto';
+}
+
+// --- File Upload + Document Analysis ---
+
+export type FileAnalysisStatus = 'pending' | 'processing' | 'done' | 'error';
+
+export interface UploadedFile {
+  id: string;
+  sessionId: string;
+  filename: string;
+  mimeType: string;
+  fileSize: number;
+  filePath: string;
+  status: FileAnalysisStatus;
+  extractedText?: string;
+  summary?: string;
+  analyzedBy?: string;
+  errorMessage?: string;
+  /** Analysis metadata (e.g. pageCount, method) */
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface NotionWriteRecord {
+  id: string;
+  sessionId: string;
+  messageId: string;
+  accountId: string;
+  notionPageId: string;
+  pageTitle: string;
+  contentPreview: string;
+  writtenAt: number;
+  status: 'success' | 'failed';
+}
+
+/* ===== RAG: Retrieval-Augmented Generation ===== */
+
+export type RAGSourceType = 'uploaded_file' | 'message' | 'imported_conversation';
+
+export interface TextChunk {
+  id: string;
+  sourceType: RAGSourceType;
+  sourceId: string;
+  sessionId?: string;
+  chunkIndex: number;
+  content: string;
+  tokenCount: number;
+  createdAt: number;
+}
+
+export interface RAGSearchQuery {
+  query: string;
+  filters?: {
+    sourceType?: RAGSourceType;
+    sessionId?: string;
+    dateFrom?: number;
+    dateTo?: number;
+  };
+  limit?: number;
+  hybridWeight?: number; // 0 = pure keyword, 1 = pure semantic, 0.5 = balanced (default)
+}
+
+export interface RAGSearchResult {
+  chunk: TextChunk;
+  score: number;
+  sourceLabel: string;   // e.g. filename, session title
+  snippet: string;       // highlighted/trimmed content
+  matchType: 'keyword' | 'semantic' | 'hybrid';
+}
+
+export interface RAGSearchResponse {
+  results: RAGSearchResult[];
+  total: number;
+  queryTimeMs: number;
+}
+
+export interface RAGAskQuery {
+  query: string;
+  model?: string;         // which LLM to use for answering
+  filters?: RAGSearchQuery['filters'];
+  maxChunks?: number;     // default 10
+  sessionId?: string;     // current session for context
+}
+
+export interface RAGAskResponse {
+  answer: string;
+  /** Maps citation number (e.g. "1", "2") to the exact excerpt from that source used in the answer */
+  citations?: Record<string, string>;
+  model: string;
+  sources: RAGSearchResult[];
+  tokenCount?: number;
+  queryTimeMs: number;
+}
+
+export interface RAGIndexStats {
+  totalChunks: number;
+  totalEmbeddings: number;
+  indexedFiles: number;
+  indexedSessions: number;
+  indexedLibrary: number;
+  embeddingModel: string;
 }

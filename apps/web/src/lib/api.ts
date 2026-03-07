@@ -1,6 +1,6 @@
 import { useChatStore } from '@/stores/chat-store';
 import type { AgentPlanStep } from '@/stores/chat-store';
-import type { TimelineEntry, AgentTask, FlowGraph, Session, SessionLink, Decision, DecisionType, ClassificationResult, ConnectorStatus, ExternalThread, ExternalMessage, DraftReply, SenderLearningStats, MonitorRule, MonitorRuleConditions, MonitorAction, MonitorRuleActionConfig, CommProvider } from '@prism/shared';
+import type { TimelineEntry, AgentTask, FlowGraph, Session, SessionLink, Decision, DecisionType, ClassificationResult, ConnectorStatus, ExternalThread, ExternalMessage, DraftReply, SenderLearningStats, MonitorRule, MonitorRuleConditions, MonitorAction, MonitorRuleActionConfig, CommProvider, UploadedFile } from '@prism/shared';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 
@@ -90,6 +90,9 @@ async function consumeSSE(response: Response) {
         if (parsed.done) {
           console.log(`[consumeSSE] ${parsed.model} done (error=${parsed.error ?? 'none'})`);
           store.markDone(parsed.model, parsed.error);
+        } else if (parsed.thinkingContent) {
+          // Thinking / chain-of-thought content — streamed separately
+          store.appendThinkingChunk(parsed.model, parsed.thinkingContent);
         } else if (parsed.content) {
           store.appendChunk(parsed.model, parsed.content);
         }
@@ -108,11 +111,20 @@ async function consumeSSE(response: Response) {
  */
 export async function streamPrompt(prompt: string) {
   const store = useChatStore.getState();
-  const { selectedModels, sessionId } = store;
+  const { selectedModels, sessionId, thinkingConfig } = store;
 
   if (selectedModels.length === 0) return;
 
   store.startStreaming();
+
+  // Only include thinking config for models that have it enabled
+  const activeThinking: Record<string, any> = {};
+  for (const model of selectedModels) {
+    const tc = thinkingConfig[model];
+    if (tc?.enabled) {
+      activeThinking[model] = tc;
+    }
+  }
 
   try {
     const response = await fetch(`${API_BASE}/api/prompt/stream`, {
@@ -122,6 +134,7 @@ export async function streamPrompt(prompt: string) {
         prompt,
         models: selectedModels,
         sessionId,
+        ...(Object.keys(activeThinking).length > 0 && { thinking: activeThinking }),
       }),
     });
 
@@ -248,7 +261,7 @@ export async function restoreSession(sessionId: string): Promise<boolean> {
     const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/messages`);
     if (!response.ok) return false;
     const data = await response.json();
-    const messages: { role: string; content: string; sourceModel: string }[] = data.messages ?? [];
+    const messages: { role: string; content: string; sourceModel: string; mode?: string }[] = data.messages ?? [];
 
     if (messages.length === 0) return false;
 
@@ -257,9 +270,16 @@ export async function restoreSession(sessionId: string): Promise<boolean> {
 
     // Rebuild responses from the latest assistant messages per model
     const latestByModel: Record<string, string> = {};
+    let lastSynthesizerModel: string | null = null;
+
     for (const msg of messages) {
       if (msg.role === 'assistant') {
         latestByModel[msg.sourceModel] = msg.content;
+
+        // Track the most recent synthesize result so we can restore it
+        if (msg.mode === 'synthesize') {
+          lastSynthesizerModel = msg.sourceModel;
+        }
       }
     }
 
@@ -270,6 +290,11 @@ export async function restoreSession(sessionId: string): Promise<boolean> {
     store.clearResponses();
     // Set responses directly via Zustand set
     useChatStore.setState({ responses });
+
+    // Restore synthesizer model if session had a synthesize result
+    if (lastSynthesizerModel) {
+      store.setSynthesizerModel(lastSynthesizerModel);
+    }
 
     // Also load the timeline
     await fetchTimeline(sessionId);
@@ -1348,4 +1373,535 @@ export async function fetchKnowledgeStats(): Promise<any> {
   const res = await fetch(`${API_BASE}/api/knowledge/stats`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
+}
+
+/* ===== Session Outline / Topic Navigation ===== */
+
+export async function generateOutline(
+  sessionId: string,
+  sourceType: 'native' | 'imported',
+  provider?: string,
+  model?: string
+): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/outlines/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId, sourceType, provider, model }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchOutline(
+  sessionId: string,
+  sourceType: 'native' | 'imported'
+): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/outlines/${sessionId}/${sourceType}`);
+  if (!res.ok) {
+    if (res.status === 404) return null;
+    throw new Error(await res.text());
+  }
+  return res.json();
+}
+
+export async function deleteOutlineApi(
+  sessionId: string,
+  sourceType: 'native' | 'imported'
+): Promise<void> {
+  await fetch(`${API_BASE}/api/outlines/${sessionId}/${sourceType}`, { method: 'DELETE' });
+}
+
+/* ===== Per-Conversation Knowledge ===== */
+
+export async function fetchConversationKnowledge(conversationId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/knowledge/conversation/${conversationId}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchSessionKnowledge(sessionId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/knowledge/session/${sessionId}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/* ===== Artifact Provenance (Phase 7d) ===== */
+
+// --- Provenance ---
+
+export async function createProvenance(data: {
+  sourceType: 'native' | 'imported';
+  sessionId?: string;
+  conversationId?: string;
+  messageId: string;
+  artifactId?: string;
+  content: string;
+  contentHash: string;
+  sourceModel: string;
+  entities?: string[];
+  tags?: string[];
+}): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/provenance`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error(`Create provenance failed: ${res.statusText}`);
+  return res.json();
+}
+
+export async function listProvenance(filters?: {
+  sourceModel?: string;
+  sourceType?: string;
+  sessionId?: string;
+  conversationId?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<{ records: any[]; total: number }> {
+  const params = new URLSearchParams();
+  if (filters) {
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v !== undefined) params.append(k, String(v));
+    });
+  }
+  const res = await fetch(`${API_BASE}/api/provenance?${params.toString()}`);
+  if (!res.ok) throw new Error(`List provenance failed: ${res.statusText}`);
+  return res.json();
+}
+
+export async function getProvenance(id: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/provenance/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error(`Get provenance failed: ${res.statusText}`);
+  return res.json();
+}
+
+export async function searchProvenanceByHash(hash: string): Promise<{ records: any[]; total: number }> {
+  const res = await fetch(`${API_BASE}/api/provenance/search/by-hash?hash=${encodeURIComponent(hash)}`);
+  if (!res.ok) throw new Error(`Search provenance failed: ${res.statusText}`);
+  return res.json();
+}
+
+export async function updateProvenanceNote(id: string, note: string): Promise<{ record: any }> {
+  const res = await fetch(`${API_BASE}/api/provenance/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ note }),
+  });
+  if (!res.ok) throw new Error(`Update provenance failed: ${res.statusText}`);
+  return res.json();
+}
+
+export async function deleteProvenanceRecord(id: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`${API_BASE}/api/provenance/${id}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(`Delete provenance failed: ${res.statusText}`);
+  return res.json();
+}
+
+/* ===== Manual Connector APIs ===== */
+
+/**
+ * Set up a manual connector account.
+ */
+export async function setupManualConnector(displayName: string): Promise<{ ok: boolean; accountId?: string; error?: string }> {
+  try {
+    const response = await fetch(`${API_BASE}/api/comm/manual/setup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ displayName }),
+    });
+    const data = await response.json();
+    if (!response.ok) return { ok: false, error: data.error ?? 'Setup failed' };
+    return { ok: true, accountId: data.accountId };
+  } catch {
+    return { ok: false, error: 'Network error' };
+  }
+}
+
+/**
+ * Create a new manual thread.
+ */
+export async function createManualThread(opts: {
+  accountId: string;
+  displayName: string;
+  subject?: string;
+  senderName?: string;
+  senderEmail?: string;
+  isGroup?: boolean;
+}): Promise<ExternalThread | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/comm/threads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.thread ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Add a message to a manual thread (paste in received email/message).
+ */
+export async function addManualMessage(
+  threadId: string,
+  opts: {
+    content: string;
+    senderName: string;
+    senderEmail?: string;
+    isInbound: boolean;
+    subject?: string;
+  }
+): Promise<ExternalMessage | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/comm/threads/${threadId}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.message ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Update a manual thread's metadata.
+ */
+export async function updateManualThread(
+  threadId: string,
+  opts: { displayName?: string; subject?: string; senderName?: string; senderEmail?: string }
+): Promise<ExternalThread | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/comm/threads/${threadId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.thread ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Delete a manual thread and its messages.
+ */
+export async function deleteManualThread(threadId: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/api/comm/threads/${threadId}`, {
+      method: 'DELETE',
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+/* ===== Notion Integration (Scenario 4) ===== */
+
+export async function setupNotionInternal(token: string): Promise<{ ok: boolean; accountId: string; pagesFound: number; message: string }> {
+  const res = await fetch(`${API_BASE}/api/notion/setup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Setup failed' }));
+    throw new Error(err.error || 'Notion setup failed');
+  }
+  return res.json();
+}
+
+export async function fetchNotionStatus(): Promise<{ connected: boolean; accounts: { accountId: string; displayName: string; connectorType: string }[] }> {
+  const res = await fetch(`${API_BASE}/api/notion/status`);
+  if (!res.ok) return { connected: false, accounts: [] };
+  return res.json();
+}
+
+export async function syncNotionPages(accountId?: string): Promise<{ ok: boolean; pagesSync: number }> {
+  const res = await fetch(`${API_BASE}/api/notion/sync`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accountId }),
+  });
+  if (!res.ok) throw new Error('Sync failed');
+  return res.json();
+}
+
+export async function fetchNotionPages(query?: string): Promise<any[]> {
+  try {
+    const params = new URLSearchParams();
+    if (query) params.set('query', query);
+    const res = await fetch(`${API_BASE}/api/notion/pages?${params}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.pages ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchNotionPageContent(id: string): Promise<{ page: any; content: string | null }> {
+  const res = await fetch(`${API_BASE}/api/notion/pages/${id}/content`);
+  if (!res.ok) throw new Error('Failed to fetch page content');
+  return res.json();
+}
+
+export async function writeToNotionPage(
+  pageId: string,
+  content: string,
+  sessionId?: string,
+  messageId?: string
+): Promise<{ ok: boolean; write?: any }> {
+  try {
+    const res = await fetch(`${API_BASE}/api/notion/pages/${pageId}/write`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, sessionId, messageId }),
+    });
+    if (!res.ok) return { ok: false };
+    return await res.json();
+  } catch {
+    return { ok: false };
+  }
+}
+
+export async function fetchContextSources(sessionId: string): Promise<any[]> {
+  try {
+    const res = await fetch(`${API_BASE}/api/notion/context-sources/${sessionId}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.sources ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function attachContextSource(
+  sessionId: string,
+  sourceId: string,
+  sourceLabel: string
+): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/notion/context-sources`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId, sourceId, sourceLabel }),
+  });
+  if (!res.ok) throw new Error('Failed to attach context source');
+  return res.json();
+}
+
+export async function detachContextSource(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/api/notion/context-sources/${id}`, {
+      method: 'DELETE',
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchNotionWrites(sessionId?: string): Promise<any[]> {
+  try {
+    const params = new URLSearchParams();
+    if (sessionId) params.set('sessionId', sessionId);
+    const res = await fetch(`${API_BASE}/api/notion/writes?${params}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.writes ?? [];
+  } catch {
+    return [];
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+// File Upload + Analysis
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Create a new session on the backend and return the session ID.
+ */
+export async function createSession(): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE}/api/sessions`, { method: 'POST' });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.session?.id ?? data.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function uploadFile(sessionId: string, file: File): Promise<UploadedFile | null> {
+  try {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('sessionId', sessionId);
+
+    const res = await fetch(`${API_BASE}/api/files/upload`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchSessionFiles(sessionId: string): Promise<UploadedFile[]> {
+  try {
+    const res = await fetch(`${API_BASE}/api/files?sessionId=${encodeURIComponent(sessionId)}`);
+    if (!res.ok) return [];
+    return await res.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchFile(fileId: string): Promise<UploadedFile | null> {
+  try {
+    const res = await fetch(`${API_BASE}/api/files/${encodeURIComponent(fileId)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function deleteFile(fileId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/api/files/${encodeURIComponent(fileId)}`, {
+      method: 'DELETE',
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ── Model Registry ──────────────────────────────────────────
+
+export interface ModelEntry {
+  id: string;
+  provider: string;
+  model: string;
+  displayName: string;
+  maxTokens: number;
+  inputCostPer1M: number;
+  outputCostPer1M: number;
+  description?: string;
+  isReasoning?: boolean;
+  supportsThinking?: boolean;
+}
+
+export interface ModelsResponse {
+  models: ModelEntry[];
+  registry: { staticCount: number; discoveredCount: number; lastRefreshedAt: number | null };
+}
+
+export async function fetchModels(): Promise<ModelsResponse | null> {
+  try {
+    const res = await fetch(`${API_BASE}/api/models`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function refreshModels(): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/api/models/refresh`, { method: 'POST' });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ===== RAG Knowledge Base =====
+
+export async function ragSearch(query: string, filters?: any, limit?: number): Promise<any> {
+  try {
+    const response = await fetch(`${API_BASE}/api/rag/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, filters, limit }),
+    });
+    if (!response.ok) return { results: [], total: 0, queryTimeMs: 0 };
+    return response.json();
+  } catch (err) {
+    console.error('[api] ragSearch failed:', err);
+    return { results: [], total: 0, queryTimeMs: 0 };
+  }
+}
+
+export async function ragAsk(query: string, filters?: any, maxChunks?: number): Promise<any> {
+  try {
+    const response = await fetch(`${API_BASE}/api/rag/ask`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, filters, maxChunks }),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  } catch (err) {
+    console.error('[api] ragAsk failed:', err);
+    return null;
+  }
+}
+
+export async function ragIndexFile(fileId: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/api/rag/index/file/${fileId}`, { method: 'POST' });
+    return response.ok;
+  } catch { return false; }
+}
+
+export async function ragIndexSession(sessionId: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/api/rag/index/session/${sessionId}`, { method: 'POST' });
+    return response.ok;
+  } catch { return false; }
+}
+
+export async function ragGetStats(): Promise<any> {
+  try {
+    const response = await fetch(`${API_BASE}/api/rag/stats`);
+    if (!response.ok) return null;
+    return response.json();
+  } catch { return null; }
+}
+
+export async function ragGetInventory(): Promise<any> {
+  try {
+    const response = await fetch(`${API_BASE}/api/rag/inventory`);
+    if (!response.ok) return { sessions: [], library: [] };
+    return response.json();
+  } catch { return { sessions: [], library: [] }; }
+}
+
+export async function ragIndexLibraryConversation(conversationId: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/api/rag/index/library/${conversationId}`, { method: 'POST' });
+    return response.ok;
+  } catch { return false; }
+}
+
+export async function ragIndexAll(): Promise<any> {
+  try {
+    const res = await fetch(`${API_BASE}/api/rag/index-all`, { method: 'POST' });
+    return await res.json();
+  } catch (err) {
+    console.error('[api] ragIndexAll failed:', err);
+    return null;
+  }
 }

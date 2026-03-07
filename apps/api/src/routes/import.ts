@@ -39,6 +39,47 @@ router.post('/upload', upload.single('file'), async (req, res) => {
 
     const result = await importService.importFile(req.file.path, platform, req.file.originalname);
     res.json(result);
+
+    // Fire-and-forget: Index all imported conversations from this batch
+    if (result.status === 'completed' && result.batchId) {
+      (async () => {
+        try {
+          const { indexImportedConversation } = await import('../services/rag-indexer');
+          const db = (await import('../memory/db')).getDb();
+
+          // Retrieve all conversation IDs from this import batch
+          const conversations = db
+            .prepare('SELECT id, title FROM imported_conversations WHERE import_batch_id = ?')
+            .all(result.batchId) as Array<{ id: string; title: string }>;
+
+          if (conversations.length === 0) {
+            console.log(`[import] No conversations found for batch ${result.batchId}`);
+            return;
+          }
+
+          console.log(`[import] Starting RAG indexing for ${conversations.length} imported conversations from batch ${result.batchId}`);
+
+          let indexedCount = 0;
+          let failedCount = 0;
+
+          // Index each conversation sequentially to avoid overwhelming the embedding API
+          for (const conv of conversations) {
+            try {
+              await indexImportedConversation(conv.id);
+              indexedCount++;
+            } catch (err: any) {
+              console.error(`[import] Failed to index conversation ${conv.id} ("${conv.title}"):`, err.message);
+              failedCount++;
+            }
+          }
+
+          console.log(`[import] RAG indexing complete for batch ${result.batchId}: ${indexedCount} indexed, ${failedCount} failed`);
+        } catch (err: any) {
+          console.error(`[import] Error during RAG indexing for batch ${result.batchId}:`, err.message);
+          // Non-critical: don't fail the import if indexing fails
+        }
+      })();
+    }
   } catch (err: any) {
     console.error('[import] Upload error:', err);
     res.status(500).json({ error: err.message });

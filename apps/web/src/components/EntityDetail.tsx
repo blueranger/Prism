@@ -1,5 +1,6 @@
 'use client';
 
+import { useCallback } from 'react';
 import { useChatStore } from '@/stores/chat-store';
 import type { EntityType } from '@prism/shared';
 
@@ -12,10 +13,31 @@ const TYPE_COLORS: Record<EntityType, string> = {
   topic: 'bg-indigo-900/50 text-indigo-400',
 };
 
+const PLATFORM_BADGE: Record<string, { label: string; cls: string }> = {
+  chatgpt: { label: 'GPT', cls: 'bg-green-900/50 text-green-400' },
+  claude: { label: 'Claude', cls: 'bg-orange-900/50 text-orange-400' },
+  gemini: { label: 'Gemini', cls: 'bg-blue-900/50 text-blue-400' },
+};
+
 export default function EntityDetail() {
   const detail = useChatStore((s) => s.knowledgeEntityDetail);
   const selectEntity = useChatStore((s) => s.selectKnowledgeEntity);
   const fetchGraph = useChatStore((s) => s.fetchKnowledgeGraph);
+  const selectLibraryConversation = useChatStore((s) => s.selectLibraryConversation);
+  const switchSession = useChatStore((s) => s.switchSession);
+  const setMode = useChatStore((s) => s.setMode);
+
+  const handleMentionClick = useCallback((m: any) => {
+    if (m.source === 'imported' && m.conversationId) {
+      // Navigate to Library mode and select this conversation
+      setMode('library');
+      selectLibraryConversation(m.conversationId);
+    } else if (m.source === 'native' && m.sessionId) {
+      // Navigate to the native Prism session
+      setMode('parallel');
+      switchSession(m.sessionId);
+    }
+  }, [setMode, selectLibraryConversation, switchSession]);
 
   if (!detail) {
     return (
@@ -98,14 +120,33 @@ export default function EntityDetail() {
             Conversations ({mentions.length})
           </h4>
           <div className="space-y-1">
-            {mentions.map((m: any, i: number) => (
-              <div key={i} className="px-2 py-1.5 rounded bg-gray-800/50 text-xs">
-                <p className="text-gray-300 truncate">{m.conversationTitle || 'Untitled'}</p>
-                {m.contextSnippet && (
-                  <p className="text-[10px] text-gray-600 mt-0.5 truncate">{m.contextSnippet}</p>
-                )}
-              </div>
-            ))}
+            {mentions.map((m: any, i: number) => {
+              const badge = m.sourcePlatform ? PLATFORM_BADGE[m.sourcePlatform] : null;
+              return (
+                <button
+                  key={i}
+                  onClick={() => handleMentionClick(m)}
+                  className="w-full text-left px-2 py-1.5 rounded bg-gray-800/50 hover:bg-gray-700/50 text-xs transition-colors cursor-pointer"
+                >
+                  <div className="flex items-center gap-1.5">
+                    {badge && (
+                      <span className={`text-[9px] px-1 py-0.5 rounded flex-shrink-0 ${badge.cls}`}>
+                        {badge.label}
+                      </span>
+                    )}
+                    {m.source === 'native' && (
+                      <span className="text-[9px] px-1 py-0.5 rounded flex-shrink-0 bg-gray-700 text-gray-400">
+                        Prism
+                      </span>
+                    )}
+                    <span className="text-gray-300 truncate">{m.conversationTitle || 'Untitled'}</span>
+                  </div>
+                  {m.contextSnippet && (
+                    <p className="text-[10px] text-gray-600 mt-0.5 truncate">{m.contextSnippet}</p>
+                  )}
+                </button>
+              );
+            })}
           </div>
         </div>
       )}

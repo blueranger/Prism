@@ -25,6 +25,11 @@ import webhooksRouter from './routes/webhooks';
 import importRouter from './routes/import';
 import searchRouter from './routes/search';
 import knowledgeRouter from './routes/knowledge';
+import outlinesRouter from './routes/outlines';
+import provenanceRouter from './routes/provenance';
+import notionRouter from './routes/notion';
+import filesRouter from './routes/files';
+import ragRouter from './routes/rag';
 
 // Import agents to trigger self-registration
 import './agents';
@@ -34,11 +39,15 @@ import './agents';
 import './connectors/outlook';
 import './connectors/outlook-local';
 import './connectors/line';
+import './connectors/teams';
+import './connectors/notion';
+import './connectors/manual';
 
 import { ConnectorRegistry } from './connectors/registry';
 import { initPolling } from './services/connector-service';
 import { initWebSocket } from './services/ws';
 import { restoreSubscriptions } from './services/graph-subscriptions';
+import { startModelRefreshScheduler } from './services/model-refresh-scheduler';
 
 // Validate required API keys at startup
 const requiredKeys = ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GOOGLE_AI_API_KEY'];
@@ -71,6 +80,11 @@ app.use('/api/webhooks', webhooksRouter);
 app.use('/api/import', importRouter);
 app.use('/api/search', searchRouter);
 app.use('/api/knowledge', knowledgeRouter);
+app.use('/api/outlines', outlinesRouter);
+app.use('/api/provenance', provenanceRouter);
+app.use('/api/notion', notionRouter);
+app.use('/api/files', filesRouter);
+app.use('/api/rag', ragRouter);
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
@@ -100,8 +114,22 @@ server.listen(API_PORT, () => {
     });
   }
 
+  // Auto-start Teams monitor agent for any restored Teams connectors (30s polling)
+  const teamsConnectors = ConnectorRegistry.getByProvider('teams');
+  if (teamsConnectors.length > 0) {
+    import('./agents/teams-monitor').then(({ startTeamsMonitoring }) => {
+      for (const conn of teamsConnectors) {
+        console.log(`[startup] Auto-starting Teams monitor for ${conn.accountId}`);
+        startTeamsMonitoring(conn.accountId);
+      }
+    });
+  }
+
   // Restore any Graph webhook subscriptions from previous run
   restoreSubscriptions().catch((err: any) => {
     console.error('[startup] Failed to restore Graph subscriptions:', err.message);
   });
+
+  // Start model discovery scheduler (if enabled via MODEL_DISCOVERY_ENABLED=true)
+  startModelRefreshScheduler();
 });

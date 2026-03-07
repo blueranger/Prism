@@ -345,12 +345,13 @@ function initSchema(db: Database.Database): void {
     );
 
     CREATE TABLE IF NOT EXISTS entity_mentions (
+      id TEXT PRIMARY KEY,
       entity_id TEXT NOT NULL,
       conversation_id TEXT,
       session_id TEXT,
       mention_count INTEGER DEFAULT 1,
       context_snippet TEXT,
-      PRIMARY KEY (entity_id, COALESCE(conversation_id, ''), COALESCE(session_id, '')),
+      UNIQUE (entity_id, conversation_id, session_id),
       FOREIGN KEY (entity_id) REFERENCES knowledge_entities(id),
       FOREIGN KEY (conversation_id) REFERENCES imported_conversations(id),
       FOREIGN KEY (session_id) REFERENCES sessions(id)
@@ -376,6 +377,133 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_entity_relations_target ON entity_relations(target_entity_id);
     CREATE INDEX IF NOT EXISTS idx_knowledge_entities_type ON knowledge_entities(entity_type);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_entities_name_type ON knowledge_entities(name, entity_type);
+
+    -- Session Outline / Topic Navigation
+    CREATE TABLE IF NOT EXISTS session_outlines (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      version INTEGER NOT NULL DEFAULT 1,
+      sections TEXT NOT NULL,
+      generated_at TEXT NOT NULL,
+      model_used TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_outlines_session
+      ON session_outlines(session_id, source_type);
+
+    -- Phase 7d: Content Provenance Tracking
+    CREATE TABLE IF NOT EXISTS content_provenance (
+      id TEXT PRIMARY KEY,
+      short_code TEXT NOT NULL UNIQUE,
+      source_type TEXT NOT NULL,
+      session_id TEXT,
+      conversation_id TEXT,
+      message_id TEXT NOT NULL,
+      artifact_id TEXT,
+      content_preview TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      source_model TEXT NOT NULL,
+      entities TEXT,
+      tags TEXT,
+      copied_at INTEGER NOT NULL,
+      note TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_provenance_short_code ON content_provenance(short_code);
+    CREATE INDEX IF NOT EXISTS idx_provenance_hash ON content_provenance(content_hash);
+    CREATE INDEX IF NOT EXISTS idx_provenance_session ON content_provenance(session_id, copied_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_provenance_conversation ON content_provenance(conversation_id, copied_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_provenance_copied_at ON content_provenance(copied_at DESC);
+
+    -- Phase 8: Notion Integration
+    CREATE TABLE IF NOT EXISTS notion_pages (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL,
+      notion_page_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      url TEXT NOT NULL,
+      content_md TEXT,
+      content_hash TEXT,
+      last_edited_at INTEGER,
+      parent_type TEXT,
+      parent_id TEXT,
+      icon_emoji TEXT,
+      synced_at INTEGER NOT NULL,
+      UNIQUE(account_id, notion_page_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_notion_pages_account ON notion_pages(account_id);
+
+    CREATE TABLE IF NOT EXISTS context_sources (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      source_type TEXT NOT NULL DEFAULT 'notion_page',
+      source_id TEXT NOT NULL,
+      source_label TEXT NOT NULL,
+      attached_at INTEGER NOT NULL,
+      attached_by TEXT NOT NULL DEFAULT 'user'
+    );
+    CREATE INDEX IF NOT EXISTS idx_context_sources_session ON context_sources(session_id);
+
+    -- File Upload + Document Analysis
+    CREATE TABLE IF NOT EXISTS uploaded_files (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      file_size INTEGER NOT NULL,
+      file_path TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      extracted_text TEXT,
+      summary TEXT,
+      analyzed_by TEXT,
+      error_message TEXT,
+      metadata TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_uploaded_files_session ON uploaded_files(session_id);
+
+    CREATE TABLE IF NOT EXISTS notion_writes (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      notion_page_id TEXT NOT NULL,
+      page_title TEXT NOT NULL,
+      content_preview TEXT NOT NULL,
+      written_at INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'success'
+    );
+    CREATE INDEX IF NOT EXISTS idx_notion_writes_session ON notion_writes(session_id);
+
+    -- RAG: Text Chunks + Embeddings
+    CREATE TABLE IF NOT EXISTS text_chunks (
+      id TEXT PRIMARY KEY,
+      source_type TEXT NOT NULL,
+      source_id TEXT NOT NULL,
+      session_id TEXT,
+      chunk_index INTEGER NOT NULL,
+      content TEXT NOT NULL,
+      token_count INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_text_chunks_source ON text_chunks(source_type, source_id);
+    CREATE INDEX IF NOT EXISTS idx_text_chunks_session ON text_chunks(session_id);
+
+    CREATE TABLE IF NOT EXISTS chunk_embeddings (
+      chunk_id TEXT PRIMARY KEY,
+      embedding BLOB NOT NULL,
+      model TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS text_chunks_fts USING fts5(
+      content,
+      content=text_chunks,
+      content_rowid=rowid,
+      tokenize='unicode61'
+    );
   `);
 
   // FTS sync triggers (created separately since CREATE TRIGGER IF NOT EXISTS
@@ -399,6 +527,9 @@ function initSchema(db: Database.Database): void {
 
   // Triage agent migration
   migrateTriageAgent(db);
+
+  // Uploaded files metadata migration
+  migrateUploadedFilesMetadata(db);
 }
 
 /**
@@ -439,6 +570,17 @@ function createFtsTriggers(db: Database.Database): void {
       INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content);
       INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
     END`,
+    // text_chunks_fts
+    `CREATE TRIGGER IF NOT EXISTS text_chunks_ai AFTER INSERT ON text_chunks BEGIN
+      INSERT INTO text_chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END`,
+    `CREATE TRIGGER IF NOT EXISTS text_chunks_ad AFTER DELETE ON text_chunks BEGIN
+      INSERT INTO text_chunks_fts(text_chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+    END`,
+    `CREATE TRIGGER IF NOT EXISTS text_chunks_au AFTER UPDATE ON text_chunks BEGIN
+      INSERT INTO text_chunks_fts(text_chunks_fts, rowid, content) VALUES('delete', old.rowid, old.content);
+      INSERT INTO text_chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END`,
   ];
 
   for (const sql of triggers) {
@@ -467,6 +609,11 @@ function backfillFts(db: Database.Database): void {
     const msgCount = (db.prepare('SELECT COUNT(*) as c FROM messages').get() as any).c;
     if (msgCount > 0) {
       db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+    }
+
+    const chunkCount = (db.prepare('SELECT COUNT(*) as c FROM text_chunks').get() as any).c;
+    if (chunkCount > 0) {
+      db.exec("INSERT INTO text_chunks_fts(text_chunks_fts) VALUES('rebuild')");
     }
   } catch (err) {
     console.warn('[db] FTS backfill warning:', err);
@@ -704,6 +851,16 @@ function migrateTriageAgent(db: Database.Database): void {
   }
   if (!connectorCols.has('triage_auto_instruction')) {
     db.exec('ALTER TABLE connectors ADD COLUMN triage_auto_instruction TEXT');
+  }
+}
+
+/**
+ * Add metadata column to uploaded_files (for existing DBs).
+ */
+function migrateUploadedFilesMetadata(db: Database.Database): void {
+  const cols = getColumnNames(db, 'uploaded_files');
+  if (!cols.has('metadata')) {
+    db.exec('ALTER TABLE uploaded_files ADD COLUMN metadata TEXT');
   }
 }
 

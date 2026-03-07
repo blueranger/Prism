@@ -1,0 +1,21 @@
+{
+  "name": "prism",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint"
+  },
+  "packageManager": "npm@11.4.2",
+  "devDependencies": {
+    "turbo": "^2.3.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "pdf-parse": "1.1.1"
+  }
+}

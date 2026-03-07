@@ -29,7 +29,17 @@ export class ImportService {
 
       // 2. Parse
       const parser = getParser(platform);
-      const { conversations, messages } = parser.parse(rawData, batchId);
+      const parsed = parser.parse(rawData, batchId);
+
+      // Filter out empty conversations (no messages)
+      const totalBefore = parsed.conversations.length;
+      const conversations = parsed.conversations.filter(c => c.messageCount > 0);
+      const validConvIds = new Set(conversations.map(c => c.id));
+      const messages = parsed.messages.filter(m => validConvIds.has(m.conversationId));
+      const skipped = totalBefore - conversations.length;
+      if (skipped > 0) {
+        console.log(`[import] Skipped ${skipped} empty conversations (0 messages)`);
+      }
 
       progress.totalConversations = conversations.length;
       progress.totalMessages = messages.length;

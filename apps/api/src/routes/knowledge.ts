@@ -4,6 +4,9 @@ import {
   listTags, getConversationsByTag,
   listEntities, getEntityDetail,
   getGraphData, getKnowledgeStats,
+  getEntitiesByConversation, getEntitiesBySession,
+  getTagsForConversation, getTagsForSession,
+  getGraphDataForConversation, getGraphDataForSession,
 } from '../memory/knowledge-store';
 
 const router = Router();
@@ -86,6 +89,30 @@ router.get('/graph', (req, res) => {
 router.get('/stats', (_req, res) => {
   const stats = getKnowledgeStats();
   res.json(stats);
+});
+
+// GET /api/knowledge/conversation/:id — Get knowledge for a specific conversation
+router.get('/conversation/:id', (req, res) => {
+  try {
+    const entities = getEntitiesByConversation(req.params.id);
+    const tags = getTagsForConversation(req.params.id);
+    const graphData = getGraphDataForConversation(req.params.id);
+    res.json({ entities, tags, graphData });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/knowledge/session/:id — Get knowledge for a specific native session
+router.get('/session/:id', (req, res) => {
+  try {
+    const entities = getEntitiesBySession(req.params.id);
+    const tags = getTagsForSession(req.params.id);
+    const graphData = getGraphDataForSession(req.params.id);
+    res.json({ entities, tags, graphData });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 export default router;

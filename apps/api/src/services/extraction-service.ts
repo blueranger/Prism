@@ -68,6 +68,7 @@ export class ExtractionService {
       SELECT ic.id, ic.title, ic.source_platform, ic.created_at
       FROM imported_conversations ic
       WHERE ic.id NOT IN (SELECT DISTINCT conversation_id FROM conversation_tags)
+        AND ic.message_count > 0
       ORDER BY ic.created_at DESC
     `).all() as any[];
 
@@ -79,22 +80,30 @@ export class ExtractionService {
       relationsFound: 0,
     };
 
+    console.log(`[extraction] Starting extraction for ${unprocessed.length} conversations using ${provider}/${model}`);
+
     try {
       const adapter = getAdapter(provider);
+      console.log(`[extraction] Adapter loaded for ${provider}`);
 
       for (const conv of unprocessed) {
         try {
+          console.log(`[extraction] Processing: "${conv.title}" (${conv.id.slice(0, 8)}...)`);
           await this.processConversation(db, adapter, provider, model, conv);
           this.progress.processedConversations++;
+          console.log(`[extraction] Done ${this.progress.processedConversations}/${this.progress.totalConversations} — entities so far: ${this.progress.entitiesFound}`);
         } catch (err: any) {
           console.error(`[extraction] Failed for conversation ${conv.id}:`, err.message);
+          console.error(`[extraction] Stack:`, err.stack?.slice(0, 500));
         }
       }
 
       this.progress.status = 'completed';
+      console.log(`[extraction] Completed! ${this.progress.entitiesFound} entities, ${this.progress.relationsFound} relations`);
     } catch (err: any) {
       this.progress.status = 'failed';
       this.progress.error = err.message;
+      console.error(`[extraction] Fatal error:`, err.message, err.stack?.slice(0, 500));
     }
 
     return this.progress;
@@ -125,6 +134,7 @@ export class ExtractionService {
 
     // Call LLM using the standard adapter.stream() interface
     let responseText = '';
+    console.log(`[extraction] Calling ${provider}/${model} for "${conv.title}" (${messages.length} messages, ~${truncated.split(/\s+/).length} words)`);
     const stream = adapter.stream({
       model,
       provider,
@@ -132,12 +142,27 @@ export class ExtractionService {
       temperature: 0.1,
     });
 
+    let chunkCount = 0;
     for await (const chunk of stream) {
-      if (chunk.content) responseText += chunk.content;
+      if (chunk.content) {
+        responseText += chunk.content;
+        chunkCount++;
+      }
+      if (chunk.error) {
+        console.error(`[extraction] LLM error chunk:`, chunk.error);
+      }
+    }
+    console.log(`[extraction] LLM responded: ${chunkCount} chunks, ${responseText.length} chars`);
+    if (responseText.length < 10) {
+      console.warn(`[extraction] Very short response: "${responseText}"`);
     }
 
     const extraction = this.parseResponse(responseText, conv.id);
-    if (!extraction) return;
+    if (!extraction) {
+      console.warn(`[extraction] No valid extraction from response (first 200 chars): ${responseText.slice(0, 200)}`);
+      return;
+    }
+    console.log(`[extraction] Parsed: ${extraction.tags?.length || 0} tags, ${extraction.entities?.length || 0} entities, ${extraction.relations?.length || 0} relations`);
 
     this.storeExtractionResults(db, extraction, conv, messages);
   }
@@ -280,9 +305,9 @@ export class ExtractionService {
         ?.content?.slice(0, 200) || '';
 
       db.prepare(`
-        INSERT OR REPLACE INTO entity_mentions (entity_id, conversation_id, mention_count, context_snippet)
-        VALUES (?, ?, 1, ?)
-      `).run(entityId, conv.id, snippet);
+        INSERT OR REPLACE INTO entity_mentions (id, entity_id, conversation_id, mention_count, context_snippet)
+        VALUES (?, ?, ?, 1, ?)
+      `).run(uuid(), entityId, conv.id, snippet);
     }
 
     // Process relations
@@ -343,9 +368,9 @@ export class ExtractionService {
         ?.content?.slice(0, 200) || '';
 
       db.prepare(`
-        INSERT OR REPLACE INTO entity_mentions (entity_id, session_id, mention_count, context_snippet)
-        VALUES (?, ?, 1, ?)
-      `).run(entityId, session.id, snippet);
+        INSERT OR REPLACE INTO entity_mentions (id, entity_id, session_id, mention_count, context_snippet)
+        VALUES (?, ?, ?, 1, ?)
+      `).run(uuid(), entityId, session.id, snippet);
     }
 
     // Process relations

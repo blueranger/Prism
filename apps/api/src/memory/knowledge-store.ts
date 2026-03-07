@@ -143,13 +143,15 @@ export function getEntityDetail(entityId: string): {
     WHERE em.entity_id = ?
   `).all(entityId) as any[];
 
-  const mentions: EntityMention[] = mentionRows.map(r => ({
+  const mentions = mentionRows.map(r => ({
     entityId: r.entity_id,
     conversationId: r.conversation_id,
     sessionId: r.session_id,
     conversationTitle: r.conv_title || r.session_title,
     mentionCount: r.mention_count,
     contextSnippet: r.context_snippet,
+    sourcePlatform: r.source_platform || null,
+    source: (r.conversation_id ? 'imported' : 'native') as 'imported' | 'native',
   }));
 
   const relationRows = db.prepare(`
@@ -280,4 +282,180 @@ export function getKnowledgeStats(): {
   `).all() as any[]).map(r => ({ name: r.name, type: r.entity_type, mentions: r.mention_count }));
 
   return { totalEntities, totalRelations, totalTags, byType, topEntities };
+}
+
+/* ===== Per-Conversation / Per-Session Knowledge ===== */
+
+export function getEntitiesByConversation(conversationId: string): KnowledgeEntity[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT ke.*, em.mention_count as conv_mention_count, em.context_snippet
+    FROM knowledge_entities ke
+    JOIN entity_mentions em ON em.entity_id = ke.id
+    WHERE em.conversation_id = ?
+    ORDER BY em.mention_count DESC
+  `).all(conversationId) as any[];
+
+  return rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    entityType: r.entity_type,
+    description: r.description,
+    aliases: r.aliases ? JSON.parse(r.aliases) : undefined,
+    firstSeenAt: r.first_seen_at,
+    mentionCount: r.conv_mention_count,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }));
+}
+
+export function getEntitiesBySession(sessionId: string): KnowledgeEntity[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT ke.*, em.mention_count as sess_mention_count, em.context_snippet
+    FROM knowledge_entities ke
+    JOIN entity_mentions em ON em.entity_id = ke.id
+    WHERE em.session_id = ?
+    ORDER BY em.mention_count DESC
+  `).all(sessionId) as any[];
+
+  return rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    entityType: r.entity_type,
+    description: r.description,
+    aliases: r.aliases ? JSON.parse(r.aliases) : undefined,
+    firstSeenAt: r.first_seen_at,
+    mentionCount: r.sess_mention_count,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }));
+}
+
+export function getTagsForConversation(conversationId: string): Tag[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT t.*, ct.confidence
+    FROM tags t
+    JOIN conversation_tags ct ON ct.tag_id = t.id
+    WHERE ct.conversation_id = ?
+    ORDER BY ct.confidence DESC
+  `).all(conversationId) as any[];
+
+  return rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    color: r.color,
+    createdAt: r.created_at,
+    source: r.source,
+  }));
+}
+
+export function getTagsForSession(sessionId: string): Tag[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT t.*, st.confidence
+    FROM tags t
+    JOIN session_tags st ON st.tag_id = t.id
+    WHERE st.session_id = ?
+    ORDER BY st.confidence DESC
+  `).all(sessionId) as any[];
+
+  return rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    color: r.color,
+    createdAt: r.created_at,
+    source: r.source,
+  }));
+}
+
+export function getGraphDataForConversation(conversationId: string): KnowledgeGraphData {
+  const db = getDb();
+
+  // Get entities mentioned in this conversation
+  const entityRows = db.prepare(`
+    SELECT ke.*
+    FROM knowledge_entities ke
+    JOIN entity_mentions em ON em.entity_id = ke.id
+    WHERE em.conversation_id = ?
+    ORDER BY ke.mention_count DESC
+    LIMIT 100
+  `).all(conversationId) as any[];
+
+  const entityIds = new Set(entityRows.map(r => r.id));
+
+  const nodes: KnowledgeGraphNode[] = entityRows.map(r => ({
+    id: r.id,
+    label: r.name,
+    type: r.entity_type,
+    size: Math.max(10, Math.min(50, r.mention_count * 5)),
+    color: ENTITY_COLORS[r.entity_type as EntityType] || '#6B7280',
+  }));
+
+  // Get relations between these entities
+  const edges: KnowledgeGraphEdge[] = [];
+  if (entityIds.size > 1) {
+    const placeholders = Array.from(entityIds).map(() => '?').join(',');
+    const relationRows = db.prepare(`
+      SELECT * FROM entity_relations
+      WHERE source_entity_id IN (${placeholders})
+      AND target_entity_id IN (${placeholders})
+    `).all(...entityIds, ...entityIds) as any[];
+
+    for (const r of relationRows) {
+      edges.push({
+        source: r.source_entity_id,
+        target: r.target_entity_id,
+        label: r.relation_type,
+        weight: r.weight,
+      });
+    }
+  }
+
+  return { nodes, edges };
+}
+
+export function getGraphDataForSession(sessionId: string): KnowledgeGraphData {
+  const db = getDb();
+
+  const entityRows = db.prepare(`
+    SELECT ke.*
+    FROM knowledge_entities ke
+    JOIN entity_mentions em ON em.entity_id = ke.id
+    WHERE em.session_id = ?
+    ORDER BY ke.mention_count DESC
+    LIMIT 100
+  `).all(sessionId) as any[];
+
+  const entityIds = new Set(entityRows.map(r => r.id));
+
+  const nodes: KnowledgeGraphNode[] = entityRows.map(r => ({
+    id: r.id,
+    label: r.name,
+    type: r.entity_type,
+    size: Math.max(10, Math.min(50, r.mention_count * 5)),
+    color: ENTITY_COLORS[r.entity_type as EntityType] || '#6B7280',
+  }));
+
+  const edges: KnowledgeGraphEdge[] = [];
+  if (entityIds.size > 1) {
+    const placeholders = Array.from(entityIds).map(() => '?').join(',');
+    const relationRows = db.prepare(`
+      SELECT * FROM entity_relations
+      WHERE source_entity_id IN (${placeholders})
+      AND target_entity_id IN (${placeholders})
+    `).all(...entityIds, ...entityIds) as any[];
+
+    for (const r of relationRows) {
+      edges.push({
+        source: r.source_entity_id,
+        target: r.target_entity_id,
+        label: r.relation_type,
+        weight: r.weight,
+      });
+    }
+  }
+
+  return { nodes, edges };
 }

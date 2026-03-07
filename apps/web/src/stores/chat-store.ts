@@ -1,11 +1,14 @@
 import { create } from 'zustand';
-import type { OperationMode, TimelineEntry, AgentTask, FlowGraph, FlowNode, Session, SessionLink, ExternalThread, ExternalMessage, DraftReply, MonitorRule, ConnectorStatus, CommNotification, ImportedConversation, ImportedMessage, ImportPlatform, ImportProgress, SearchResult, KnowledgeGraphData, KnowledgeEntity, Tag, ExtractionProgress } from '@prism/shared';
+import { MAX_SELECTED_MODELS, MODELS, DEFAULT_MODELS } from '@prism/shared';
+import type { OperationMode, TimelineEntry, AgentTask, FlowGraph, FlowNode, Session, SessionLink, ExternalThread, ExternalMessage, DraftReply, MonitorRule, ConnectorStatus, CommNotification, ImportedConversation, ImportedMessage, ImportPlatform, ImportProgress, SearchResult, KnowledgeGraphData, KnowledgeEntity, Tag, ExtractionProgress, SessionOutline, ContextSource, KnowledgeHintMatch, ThinkingConfig } from '@prism/shared';
 
 export interface ModelResponse {
   model: string;
   content: string;
   done: boolean;
   error?: string;
+  /** Accumulated thinking / chain-of-thought content */
+  thinkingContent?: string;
 }
 
 /** Agent plan step for the dashboard */
@@ -105,6 +108,38 @@ interface ChatState {
   knowledgeExtractionProgress: ExtractionProgress | null;
   knowledgeLoading: boolean;
 
+  // Session Outline / Topic Navigation
+  sessionOutline: SessionOutline | null;
+  sessionOutlineLoading: boolean;
+  outlineTab: 'timeline' | 'topics' | 'knowledge';
+  outlineScrollTarget: number | null;
+  outlineHighlightRange: { start: number; end: number } | null;
+
+  // Per-conversation Knowledge
+  conversationKnowledge: {
+    entities: KnowledgeEntity[];
+    tags: Tag[];
+    graphData: KnowledgeGraphData | null;
+    loading: boolean;
+  } | null;
+
+  // Notion context sources
+  notionContextSources: ContextSource[];
+  notionPickerOpen: boolean;
+  notionSourcesLoading: boolean;
+
+  // Provenance lookup (cross-component navigation)
+  provenanceLookupCode: string | null;
+
+  // Scenario 1 — Knowledge Hints while typing
+  knowledgeHintsEnabled: boolean;
+  knowledgeHintMatches: KnowledgeHintMatch[];
+  knowledgeHintLoading: boolean;
+  knowledgeHintDismissed: boolean;
+
+  // Thinking / Reasoning mode (per-model)
+  thinkingConfig: Record<string, ThinkingConfig>;
+
   setMode: (mode: OperationMode) => void;
   toggleModel: (model: string) => void;
   setSelectedModels: (models: string[]) => void;
@@ -188,11 +223,45 @@ interface ChatState {
   triggerKnowledgeExtraction: (provider?: string, model?: string) => Promise<void>;
   pollExtractionProgress: () => Promise<void>;
   fetchKnowledgeStatsAction: () => Promise<void>;
+
+  // Outline actions
+  fetchSessionOutline: (sessionId: string, sourceType: 'native' | 'imported') => Promise<void>;
+  generateSessionOutline: (sessionId: string, sourceType: 'native' | 'imported', provider?: string, model?: string) => Promise<void>;
+  setOutlineTab: (tab: 'timeline' | 'topics' | 'knowledge') => void;
+  setOutlineScrollTarget: (index: number | null) => void;
+  setOutlineHighlightRange: (range: { start: number; end: number } | null) => void;
+  clearOutline: () => void;
+
+  // Per-conversation Knowledge
+  fetchConversationKnowledge: (id: string, sourceType: 'native' | 'imported') => Promise<void>;
+  clearConversationKnowledge: () => void;
+
+  // Notion context sources
+  setNotionPickerOpen: (open: boolean) => void;
+  fetchNotionContextSources: (sessionId: string) => Promise<void>;
+  attachNotionSource: (sessionId: string, sourceId: string, sourceLabel: string) => Promise<void>;
+  detachNotionSource: (id: string) => Promise<void>;
+
+  // Provenance lookup
+  lookupProvenance: (shortCode: string) => void;
+  clearProvenanceLookup: () => void;
+
+  // Knowledge Hints actions
+  setKnowledgeHintsEnabled: (enabled: boolean) => void;
+  setKnowledgeHintMatches: (matches: KnowledgeHintMatch[]) => void;
+  setKnowledgeHintLoading: (loading: boolean) => void;
+  dismissKnowledgeHints: () => void;
+  clearKnowledgeHints: () => void;
+
+  // Thinking actions
+  setThinkingConfig: (model: string, config: ThinkingConfig) => void;
+  clearThinkingConfig: (model: string) => void;
+  appendThinkingChunk: (model: string, content: string) => void;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
   mode: 'parallel',
-  selectedModels: ['gpt-4o', 'claude-sonnet-4-20250514', 'gemini-2.5-flash'],
+  selectedModels: DEFAULT_MODELS,
   responses: {},
   isStreaming: false,
   sessionId: null,
@@ -261,17 +330,63 @@ export const useChatStore = create<ChatState>((set, get) => ({
   knowledgeExtractionProgress: null,
   knowledgeLoading: false,
 
+  // Outline
+  sessionOutline: null,
+  sessionOutlineLoading: false,
+  outlineTab: 'timeline',
+  outlineScrollTarget: null,
+  outlineHighlightRange: null,
+
+  // Per-conversation Knowledge
+  conversationKnowledge: null,
+
+  // Notion context sources
+  notionContextSources: [],
+  notionPickerOpen: false,
+  notionSourcesLoading: false,
+
+  // Provenance lookup
+  provenanceLookupCode: null,
+
+  // Knowledge Hints
+  knowledgeHintsEnabled: true,
+  knowledgeHintMatches: [],
+  knowledgeHintLoading: false,
+  knowledgeHintDismissed: false,
+
+  // Thinking — default ON for all models that support it, middle preset
+  thinkingConfig: Object.fromEntries(
+    Object.entries(MODELS)
+      .filter(([, cfg]) => cfg.supportsThinking)
+      .map(([id, cfg]) => [
+        id,
+        cfg.provider === 'openai'
+          ? { enabled: true, effort: 'medium' as const }
+          : { enabled: true, budgetTokens: 8192 },
+      ]),
+  ),
+
   setMode: (mode) => set({ mode, responses: {} }),
 
   toggleModel: (model) =>
     set((state) => {
-      const selected = state.selectedModels.includes(model)
-        ? state.selectedModels.filter((m) => m !== model)
-        : [...state.selectedModels, model];
+      let selected: string[];
+      if (state.selectedModels.includes(model)) {
+        selected = state.selectedModels.filter((m) => m !== model);
+      } else {
+        // Enforce max selection limit
+        if (state.selectedModels.length >= MAX_SELECTED_MODELS) return {};
+        selected = [...state.selectedModels, model];
+      }
+      try { localStorage.setItem('prism_selectedModels', JSON.stringify(selected)); } catch {}
       return { selectedModels: selected };
     }),
 
-  setSelectedModels: (models) => set({ selectedModels: models }),
+  setSelectedModels: (models) => {
+    const capped = models.slice(0, MAX_SELECTED_MODELS);
+    try { localStorage.setItem('prism_selectedModels', JSON.stringify(capped)); } catch {}
+    return set({ selectedModels: capped });
+  },
 
   startStreaming: () =>
     set((state) => {
@@ -417,6 +532,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       linkedSessions: [],
       sessionDrawerOpen: false,
       linkPickerOpen: false,
+      notionContextSources: [],
+      notionPickerOpen: false,
+      knowledgeHintMatches: [],
+      knowledgeHintLoading: false,
+      knowledgeHintDismissed: false,
     });
   },
 
@@ -441,6 +561,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       flowSelectedNode: null,
       linkedSessions: [],
       sessionDrawerOpen: false,
+      notionContextSources: [],
+      notionPickerOpen: false,
+      knowledgeHintMatches: [],
+      knowledgeHintLoading: false,
+      knowledgeHintDismissed: false,
     });
   },
 
@@ -657,4 +782,137 @@ export const useChatStore = create<ChatState>((set, get) => ({
       console.error('[knowledge] stats fetch error:', err);
     }
   },
+
+  // Outline actions
+  fetchSessionOutline: async (sessionId, sourceType) => {
+    set({ sessionOutlineLoading: true });
+    try {
+      const { fetchOutline } = await import('@/lib/api');
+      const result = await fetchOutline(sessionId, sourceType);
+      set({ sessionOutline: result?.outline || null });
+    } catch (err) {
+      console.error('[outline] fetch error:', err);
+      set({ sessionOutline: null });
+    } finally {
+      set({ sessionOutlineLoading: false });
+    }
+  },
+
+  generateSessionOutline: async (sessionId, sourceType, provider, model) => {
+    set({ sessionOutlineLoading: true });
+    try {
+      const { generateOutline } = await import('@/lib/api');
+      const result = await generateOutline(sessionId, sourceType, provider, model);
+      set({ sessionOutline: result?.outline || null });
+    } catch (err) {
+      console.error('[outline] generate error:', err);
+    } finally {
+      set({ sessionOutlineLoading: false });
+    }
+  },
+
+  setOutlineTab: (tab) => set({ outlineTab: tab }),
+  setOutlineScrollTarget: (index) => set({ outlineScrollTarget: index }),
+  setOutlineHighlightRange: (range) => set({ outlineHighlightRange: range }),
+  clearOutline: () => set({ sessionOutline: null, outlineScrollTarget: null, outlineHighlightRange: null }),
+
+  fetchConversationKnowledge: async (id, sourceType) => {
+    set({ conversationKnowledge: { entities: [], tags: [], graphData: null, loading: true } });
+    try {
+      if (sourceType === 'imported') {
+        const { fetchConversationKnowledge } = await import('@/lib/api');
+        const data = await fetchConversationKnowledge(id);
+        set({ conversationKnowledge: { entities: data.entities || [], tags: data.tags || [], graphData: data.graphData || null, loading: false } });
+      } else {
+        const { fetchSessionKnowledge } = await import('@/lib/api');
+        const data = await fetchSessionKnowledge(id);
+        set({ conversationKnowledge: { entities: data.entities || [], tags: data.tags || [], graphData: data.graphData || null, loading: false } });
+      }
+    } catch (err) {
+      console.error('[conversation-knowledge] fetch error:', err);
+      set({ conversationKnowledge: null });
+    }
+  },
+
+  clearConversationKnowledge: () => set({ conversationKnowledge: null }),
+
+  // Notion context source actions
+  setNotionPickerOpen: (open) => set({ notionPickerOpen: open }),
+
+  fetchNotionContextSources: async (sessionId) => {
+    set({ notionSourcesLoading: true });
+    try {
+      const { fetchContextSources } = await import('@/lib/api');
+      const sources = await fetchContextSources(sessionId);
+      set({ notionContextSources: sources });
+    } catch (err) {
+      console.error('[notion] fetch context sources error:', err);
+    } finally {
+      set({ notionSourcesLoading: false });
+    }
+  },
+
+  attachNotionSource: async (sessionId, sourceId, sourceLabel) => {
+    try {
+      const { attachContextSource } = await import('@/lib/api');
+      await attachContextSource(sessionId, sourceId, sourceLabel);
+      await get().fetchNotionContextSources(sessionId);
+    } catch (err) {
+      console.error('[notion] attach source error:', err);
+    }
+  },
+
+  detachNotionSource: async (id) => {
+    try {
+      const { detachContextSource } = await import('@/lib/api');
+      await detachContextSource(id);
+      const sessionId = get().sessionId;
+      if (sessionId) {
+        await get().fetchNotionContextSources(sessionId);
+      }
+    } catch (err) {
+      console.error('[notion] detach source error:', err);
+    }
+  },
+
+  // Provenance lookup — switches to provenance mode and sets the code for auto-search
+  lookupProvenance: (shortCode) => {
+    set({ provenanceLookupCode: shortCode, mode: 'provenance' as OperationMode });
+  },
+  clearProvenanceLookup: () => set({ provenanceLookupCode: null }),
+
+  // Knowledge Hints actions
+  setKnowledgeHintsEnabled: (enabled) => set({ knowledgeHintsEnabled: enabled }),
+  setKnowledgeHintMatches: (matches) => set({ knowledgeHintMatches: matches, knowledgeHintDismissed: false }),
+  setKnowledgeHintLoading: (loading) => set({ knowledgeHintLoading: loading }),
+  dismissKnowledgeHints: () => set({ knowledgeHintDismissed: true }),
+  clearKnowledgeHints: () => set({ knowledgeHintMatches: [], knowledgeHintLoading: false, knowledgeHintDismissed: false }),
+
+  // Thinking actions
+  setThinkingConfig: (model, config) =>
+    set((state) => ({
+      thinkingConfig: { ...state.thinkingConfig, [model]: config },
+    })),
+
+  clearThinkingConfig: (model) =>
+    set((state) => {
+      const next = { ...state.thinkingConfig };
+      delete next[model];
+      return { thinkingConfig: next };
+    }),
+
+  appendThinkingChunk: (model, content) =>
+    set((state) => {
+      const existing = state.responses[model];
+      if (!existing) return state;
+      return {
+        responses: {
+          ...state.responses,
+          [model]: {
+            ...existing,
+            thinkingContent: (existing.thinkingContent ?? '') + content,
+          },
+        },
+      };
+    }),
 }));
