@@ -334,4 +334,9 @@ If you are evaluating the repo, the best way to understand it is:
 
 ## License
 
-No license file is currently included in this repository. Assume all rights reserved unless a license is added.
+This project is licensed under the GNU Affero General Public License v3.0.
+
+- License file: [LICENSE](./LICENSE)
+- SPDX identifier: `AGPL-3.0-only`
+
+If you modify Prism and provide it as a networked service, the AGPL requires that the corresponding source for that modified version be made available to users of that service.
