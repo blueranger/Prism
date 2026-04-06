@@ -43,7 +43,7 @@ Recent releases significantly expanded Prism from a conversation workspace into 
   - retry failed
   - crash-safe resume
 
-See [RELEASE_NOTES_2026-04-06.md](./RELEASE_NOTES_2026-04-06.md) for the current release summary.
+See [docs/releases/2026-04-06.md](./docs/releases/2026-04-06.md) for the current in-repo release summary. For formal version announcements, GitHub Releases is the recommended publishing surface.
 
 ## What This Project Does
 
