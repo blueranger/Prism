@@ -12,6 +12,39 @@ Instead of treating each model as a separate chat silo, Prism keeps the conversa
 - monitor external communication channels and draft replies
 - import past AI conversations into a searchable knowledge base
 
+## What's New
+
+Recent releases significantly expanded Prism from a conversation workspace into a source-driven personal wiki compiler.
+
+- `Compile Source to Wiki`: analyze one source and generate a reviewable multi-artifact compile plan before writing to Obsidian
+- `Compile Plan` and `Compiler Summary`: save compiler reasoning and output summaries as markdown records
+- wiki infrastructure generation:
+  - `SCHEMA.md`
+  - `PRISM_WIKI.md`
+  - `index.md`
+  - `log.md`
+- richer wiki page kinds:
+  - `source`
+  - `context`
+  - `observation`
+  - `evergreen`
+  - `concept`
+  - `topic`
+  - `project`
+  - `partner`
+  - `entity`
+- `Backfill Planner`: review and process historical conversation archives into the wiki in batches
+- background backfill jobs with:
+  - progress tracking
+  - batch-by-batch linting
+  - adaptive tuning notes
+  - pause / resume
+  - cancel
+  - retry failed
+  - crash-safe resume
+
+See [RELEASE_NOTES_2026-04-06.md](./RELEASE_NOTES_2026-04-06.md) for the current release summary.
+
 ## What This Project Does
 
 Prism combines three product ideas into one system:
@@ -88,6 +121,9 @@ At a high level:
 - knowledge extraction (entities, tags, graph relationships)
 - hybrid RAG search over indexed chunks and embeddings
 - citation-oriented question answering
+- source-driven wiki compilation into Obsidian
+- compile plans, compiler summaries, and wiki maintenance history
+- background backfill from Library into a personal knowledge base
 
 ### File handling
 
@@ -191,7 +227,29 @@ This starts:
 2. Let Prism index the conversations
 3. Browse `Library`
 4. Explore `Knowledge`
-5. Use `KB` mode to ask questions across imported and native data
+5. Use `Compile Source to Wiki` to review and apply wiki updates into Obsidian
+6. Use `Backfill Planner` to progressively turn older conversations into a structured knowledge base
+7. Use `KB` mode to ask questions across imported and native data
+
+### Backfill workflow
+
+Prism now supports a staged archive-to-wiki workflow from `Library`:
+
+1. Open `Backfill Planner`
+2. Analyze the archive
+3. Review recommended actions:
+   - `Compile now`
+   - `Archive only`
+   - `Skip`
+4. Apply the plan to start a background backfill run
+5. Monitor:
+   - current session
+   - processed / remaining counts
+   - current batch progress
+   - tuning notes
+6. Pause, resume, cancel, or retry failed items as needed
+
+`Archive only` stores the raw source in `Sources/` and updates the wiki index/log without generating the full knowledge artifacts yet.
 
 ## Connectors and Integrations
 
