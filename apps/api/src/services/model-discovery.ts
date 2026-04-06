@@ -57,19 +57,8 @@ export async function discoverOpenAIModels(): Promise<DiscoveredModel[]> {
 
 // ── Anthropic ───────────────────────────────────────────────
 
-/**
- * Anthropic doesn't have a list-models API.
- * We maintain a known-models list and verify connectivity.
- */
-const KNOWN_ANTHROPIC_MODELS: Omit<DiscoveredModel, 'discoveredAt'>[] = [
-  { model: 'claude-opus-4-6', provider: 'anthropic', displayName: 'Claude Opus 4.6', maxTokens: 1000000 },
-  { model: 'claude-sonnet-4-6', provider: 'anthropic', displayName: 'Claude Sonnet 4.6', maxTokens: 1000000 },
-  { model: 'claude-opus-4-5-20250918', provider: 'anthropic', displayName: 'Claude Opus 4.5', maxTokens: 200000 },
-  { model: 'claude-sonnet-4-5-20250929', provider: 'anthropic', displayName: 'Claude Sonnet 4.5', maxTokens: 200000 },
-  { model: 'claude-sonnet-4-20250514', provider: 'anthropic', displayName: 'Claude Sonnet 4', maxTokens: 200000 },
-  { model: 'claude-haiku-4-5-20251001', provider: 'anthropic', displayName: 'Claude Haiku 4.5', maxTokens: 200000 },
-  { model: 'claude-haiku-3-5-20241022', provider: 'anthropic', displayName: 'Claude Haiku 3.5', maxTokens: 200000 },
-];
+const ANTHROPIC_API_VERSION = '2023-06-01';
+const DEFAULT_ANTHROPIC_MAX_TOKENS = 200000;
 
 export async function discoverAnthropicModels(): Promise<DiscoveredModel[]> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -77,11 +66,49 @@ export async function discoverAnthropicModels(): Promise<DiscoveredModel[]> {
     console.warn('[model-discovery] ANTHROPIC_API_KEY not set, skipping Anthropic discovery');
     return [];
   }
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/models', {
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': ANTHROPIC_API_VERSION,
+        Accept: 'application/json',
+      },
+    });
 
-  // Just return known list with timestamp (no list API available)
-  const now = Date.now();
-  console.log(`[model-discovery] Anthropic: returning ${KNOWN_ANTHROPIC_MODELS.length} known models`);
-  return KNOWN_ANTHROPIC_MODELS.map((m) => ({ ...m, discoveredAt: now }));
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const data = await response.json() as {
+      data?: Array<{
+        id?: string;
+        display_name?: string;
+        type?: string;
+      }>;
+    };
+
+    const now = Date.now();
+    const results: DiscoveredModel[] = [];
+
+    for (const model of data.data ?? []) {
+      const id = model.id?.trim();
+      if (!id) continue;
+
+      results.push({
+        model: id,
+        provider: 'anthropic' as LLMProvider,
+        displayName: model.display_name?.trim() || id,
+        maxTokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+        discoveredAt: now,
+      });
+    }
+
+    console.log(`[model-discovery] Anthropic: discovered ${results.length} models`);
+    return results;
+  } catch (err: any) {
+    console.error('[model-discovery] Anthropic discovery failed:', err.message);
+    return [];
+  }
 }
 
 // ── Google ──────────────────────────────────────────────────

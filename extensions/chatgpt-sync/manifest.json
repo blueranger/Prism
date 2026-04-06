@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Prism ChatGPT Sync",
+  "version": "0.1.0",
+  "description": "Sync selected ChatGPT personal conversations into Prism Library.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "http://localhost:3001/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "injected.js"
+      ],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ]
+    }
+  ]
+}

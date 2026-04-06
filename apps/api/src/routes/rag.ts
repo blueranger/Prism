@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { ragSearch } from '../services/rag-search';
+import { getDb } from '../memory/db';
 import {
   indexUploadedFile,
   indexSessionMessages,
@@ -13,9 +14,64 @@ import type {
   RAGAskQuery,
   RAGAskResponse,
   RAGIndexStats,
+  RAGSearchResult,
+  RAGSourceMetadata,
 } from '@prism/shared';
 
 const router = Router();
+
+function normalizeCitationText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function buildCitationNeedle(text: string): string {
+  const normalized = normalizeCitationText(text);
+  return normalized.slice(0, Math.min(80, normalized.length));
+}
+
+function resolveCitationTimestamp(result: RAGSearchResult, excerpt: string): string | number | null {
+  const db = getDb();
+  const needle = buildCitationNeedle(excerpt);
+  if (!needle) return null;
+
+  if (result.chunk.sourceType === 'message') {
+    const sessionId = result.sourceMeta?.sessionId ?? result.chunk.sessionId ?? result.chunk.sourceId;
+    const rows = db.prepare(`
+      SELECT timestamp, content
+      FROM messages
+      WHERE session_id = ?
+      ORDER BY timestamp ASC
+    `).all(sessionId) as Array<{ timestamp: number; content: string }>;
+
+    for (const row of rows) {
+      const normalized = normalizeCitationText(row.content);
+      if (!normalized) continue;
+      if (normalized.includes(needle) || needle.includes(normalized.slice(0, Math.min(80, normalized.length)))) {
+        return row.timestamp;
+      }
+    }
+  }
+
+  if (result.chunk.sourceType === 'imported_conversation') {
+    const conversationId = result.sourceMeta?.conversationId ?? result.chunk.sourceId;
+    const rows = db.prepare(`
+      SELECT timestamp, content
+      FROM imported_messages
+      WHERE conversation_id = ?
+      ORDER BY timestamp ASC
+    `).all(conversationId) as Array<{ timestamp: string; content: string }>;
+
+    for (const row of rows) {
+      const normalized = normalizeCitationText(row.content);
+      if (!normalized) continue;
+      if (normalized.includes(needle) || needle.includes(normalized.slice(0, Math.min(80, normalized.length)))) {
+        return row.timestamp;
+      }
+    }
+  }
+
+  return null;
+}
 
 /**
  * POST /search
@@ -143,12 +199,32 @@ Citation rules:
       console.warn('[rag/ask] Failed to parse JSON response, using raw text:', (parseErr as Error).message);
     }
 
+    const enrichedSources = searchResponse.results.map((result, index) => {
+      const citationKey = String(index + 1);
+      const excerpt = citationExcerpts[citationKey];
+      if (!excerpt) return result;
+      const nextSourceMeta: RAGSourceMetadata = result.sourceMeta
+        ? { ...result.sourceMeta, citedAt: resolveCitationTimestamp(result, excerpt) }
+        : {
+            sourceType: result.chunk.sourceType,
+            sourceId: result.chunk.sourceId,
+            sessionId: result.chunk.sessionId ?? null,
+            conversationId: result.chunk.sourceType === 'imported_conversation' ? result.chunk.sourceId : null,
+            citedAt: resolveCitationTimestamp(result, excerpt),
+          };
+
+      return {
+        ...result,
+        sourceMeta: nextSourceMeta,
+      };
+    });
+
     // Step 4: Build response
     const response: RAGAskResponse = {
       answer: answerText,
       citations: citationExcerpts,
       model: model || process.env.FILE_ANALYSIS_TEXT_MODEL || 'gpt-4o-mini',
-      sources: searchResponse.results,
+      sources: enrichedSources,
       queryTimeMs: searchResponse.queryTimeMs,
     };
 

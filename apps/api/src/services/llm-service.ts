@@ -1,7 +1,13 @@
-import { LLMRequest, StreamChunk, MODELS, MessageRole, ThinkingConfig } from '@prism/shared';
+import { LLMRequest, StreamChunk, MessageRole, ThinkingConfig } from '@prism/shared';
 import { getAdapterForModel } from '../adapters';
+import { modelRegistry } from './model-registry';
 
 export type ChatMessage = { role: MessageRole; content: string };
+type TimeoutReason = 'startup_timeout' | 'idle_timeout' | 'overall_timeout';
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * Stream a prompt to a single model with the given context.
@@ -9,9 +15,10 @@ export type ChatMessage = { role: MessageRole; content: string };
 export async function* streamSingle(
   model: string,
   messages: ChatMessage[],
-  thinking?: ThinkingConfig
+  thinking?: ThinkingConfig,
+  opts: { maxTokens?: number } = {}
 ): AsyncGenerator<StreamChunk> {
-  const config = MODELS[model];
+  const config = modelRegistry.getById(model);
   if (!config) throw new Error(`Unknown model: ${model}`);
 
   const adapter = getAdapterForModel(model);
@@ -19,10 +26,85 @@ export async function* streamSingle(
     messages,
     model: config.model,
     provider: config.provider,
+    maxTokens: opts.maxTokens,
     thinking,
   };
 
   yield* adapter.stream(request);
+}
+
+export async function* streamSingleWithTimeout(
+  model: string,
+  messages: ChatMessage[],
+  thinking?: ThinkingConfig,
+  opts: { startupTimeoutMs?: number; idleTimeoutMs?: number; overallTimeoutMs?: number; maxTokens?: number } = {}
+): AsyncGenerator<StreamChunk & { timeoutReason?: TimeoutReason }> {
+  const startupTimeoutMs = opts.startupTimeoutMs ?? 60_000;
+  const idleTimeoutMs = opts.idleTimeoutMs ?? 20_000;
+  const overallTimeoutMs = opts.overallTimeoutMs ?? 120_000;
+  const config = modelRegistry.getById(model);
+  const provider = config?.provider ?? 'openai';
+  const iterator = streamSingle(model, messages, thinking, { maxTokens: opts.maxTokens })[Symbol.asyncIterator]();
+  const startedAt = Date.now();
+  let lastChunkAt = Date.now();
+  let hasReceivedChunk = false;
+  let pendingNext: Promise<IteratorResult<StreamChunk>> | null = iterator.next();
+
+  while (true) {
+    const result = await Promise.race([
+      pendingNext.then((value) => ({ kind: 'next' as const, value })),
+      sleep(1000).then(() => ({ kind: 'tick' as const })),
+    ]);
+
+    if (result.kind === 'tick') {
+      const now = Date.now();
+      const silentForMs = now - lastChunkAt;
+      if (!hasReceivedChunk && silentForMs > startupTimeoutMs) {
+        yield {
+          provider,
+          model,
+          content: '',
+          done: true,
+          error: 'Request timed out while establishing the stream',
+          timeoutReason: 'startup_timeout',
+        };
+        return;
+      }
+      if (hasReceivedChunk && silentForMs > idleTimeoutMs) {
+        yield {
+          provider,
+          model,
+          content: '',
+          done: true,
+          error: 'Request timed out',
+          timeoutReason: 'idle_timeout',
+        };
+        return;
+      }
+      if (now - startedAt > overallTimeoutMs) {
+        yield {
+          provider,
+          model,
+          content: '',
+          done: true,
+          error: 'Request timed out',
+          timeoutReason: 'overall_timeout',
+        };
+        return;
+      }
+      continue;
+    }
+
+    if (result.value.done) {
+      return;
+    }
+
+    hasReceivedChunk = true;
+    lastChunkAt = Date.now();
+    yield result.value.value;
+    if (result.value.value.done) return;
+    pendingNext = iterator.next();
+  }
 }
 
 /**
@@ -43,7 +125,7 @@ export async function* streamParallel(
 
   // Create a stream for each model
   const streams = models.map((model) => {
-    const config = MODELS[model];
+    const config = modelRegistry.getById(model);
     if (!config) throw new Error(`Unknown model: ${model}`);
 
     // Use per-model context if provided, otherwise shared history
@@ -54,15 +136,7 @@ export async function* streamParallel(
       messages = [...history, { role: 'user' as const, content: prompt }];
     }
 
-    const adapter = getAdapterForModel(model);
-    const request: LLMRequest = {
-      messages,
-      model: config.model,
-      provider: config.provider,
-      thinking: thinking?.[model],
-    };
-
-    return adapter.stream(request);
+    return streamSingleWithTimeout(model, messages, thinking?.[model]);
   });
 
   // Interleave chunks from all streams using a shared queue
@@ -72,7 +146,7 @@ export async function* streamParallel(
 
   const readers = streams.map(async (stream, idx) => {
     const modelName = models[idx];
-    const modelConfig = MODELS[modelName];
+    const modelConfig = modelRegistry.getById(modelName);
     console.log(`[streamParallel] Reader ${idx} starting for ${modelName}`);
     try {
       let chunkCount = 0;
@@ -122,7 +196,7 @@ export async function* streamParallel(
         // Push done markers for any models that haven't finished
         for (let i = 0; i < models.length; i++) {
           const mName = models[i];
-          const mConfig = MODELS[mName];
+          const mConfig = modelRegistry.getById(mName);
           // We can't easily track which specific readers are done, so just push timeout errors
           // The frontend will deduplicate via markDone
           queue.push({

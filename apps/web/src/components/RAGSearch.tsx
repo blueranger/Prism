@@ -3,20 +3,39 @@
 import { useState, useCallback, useEffect, useRef, useMemo, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { ragSearch, ragAsk, ragGetStats, ragGetInventory, ragIndexFile, ragIndexSession, ragIndexLibraryConversation, ragIndexAll } from '@/lib/api';
+import { bootstrapSessionFromKB, ragSearch, ragAsk, ragGetStats, ragGetInventory, ragIndexFile, ragIndexSession, ragIndexLibraryConversation, ragIndexAll, switchToSession } from '@/lib/api';
+import { useChatStore } from '@/stores/chat-store';
+import type { RAGSourceType } from '@prism/shared';
 
 interface RAGResult {
   chunk: {
     id: string;
     sourceType: string;
     sourceId: string;
+    sessionId?: string;
     content: string;
     tokenCount: number;
+    createdAt?: number;
   };
   score: number;
   sourceLabel: string;
   snippet: string;
   matchType: string;
+  sourceMeta?: {
+    sourceType: string;
+    sourceId: string;
+    sessionId?: string | null;
+    conversationId?: string | null;
+    sourcePlatform?: string | null;
+    projectName?: string | null;
+    workspaceName?: string | null;
+    model?: string | null;
+    sourceCreatedAt?: string | number | null;
+    sourceUpdatedAt?: string | number | null;
+    sourceLastActivityAt?: string | number | null;
+    sourceSyncedAt?: string | number | null;
+    citedAt?: string | number | null;
+  };
 }
 
 interface InventoryFile {
@@ -58,6 +77,33 @@ interface LibraryConversation {
   embeddingCount: number;
 }
 
+interface KBHistoryItem {
+  id: string;
+  query: string;
+  mode: 'search' | 'ask';
+  createdAt: number;
+  resultCount?: number;
+  answerPreview?: string;
+}
+
+const KB_HISTORY_KEY = 'prism_kb_history_v1';
+const KB_LAST_STATE_KEY = 'prism_kb_last_state_v1';
+const KB_HISTORY_LIMIT = 12;
+
+interface KBLastState {
+  query: string;
+  searchMode: 'search' | 'ask';
+  results: RAGResult[];
+  answer: string | null;
+  answerSources: RAGResult[];
+  queryTimeMs: number;
+  total: number;
+  expandedChunk: string | null;
+  citationExcerpts: Record<string, string>;
+  showUncitedSources: boolean;
+  selectedSourceNums: number[];
+}
+
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -68,6 +114,19 @@ function formatDate(ts: number): string {
   return new Date(ts).toLocaleDateString('zh-TW', {
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit',
+  });
+}
+
+function formatMaybeDate(value: string | number | null | undefined): string | null {
+  if (value === null || value === undefined || value === '') return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString('zh-TW', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
   });
 }
 
@@ -276,6 +335,9 @@ function mapNormalizedIndex(original: string, normalizedIdx: number): number {
 }
 
 export default function RAGSearch() {
+  const setMode = useChatStore((s) => s.setMode);
+  const selectLibraryConversation = useChatStore((s) => s.selectLibraryConversation);
+
   // Tab: 'search' or 'inventory'
   const [tab, setTab] = useState<'search' | 'inventory'>('search');
 
@@ -293,8 +355,14 @@ export default function RAGSearch() {
   const [highlightedCitation, setHighlightedCitation] = useState<number | null>(null);
   const [citationExcerpts, setCitationExcerpts] = useState<Record<string, string>>({});
   const [showUncitedSources, setShowUncitedSources] = useState(false);
+  const [history, setHistory] = useState<KBHistoryItem[]>([]);
+  const [selectedSourceNums, setSelectedSourceNums] = useState<Set<number>>(new Set());
+  const [bootstrapModalOpen, setBootstrapModalOpen] = useState(false);
+  const [bootstrappingSession, setBootstrappingSession] = useState(false);
   const sourceRefs = useRef<Map<number, HTMLElement>>(new Map());
   const inputRef = useRef<HTMLInputElement>(null);
+  const hasHydratedLastStateRef = useRef(false);
+  const skipNextSelectionDefaultsRef = useRef(false);
 
   // Compute which citation numbers appear in the answer text
   const { citedNums, citedSources, uncitedSources } = useMemo(() => {
@@ -316,6 +384,23 @@ export default function RAGSearch() {
     return { citedNums: nums, citedSources: cited, uncitedSources: uncited };
   }, [answer, answerSources]);
 
+  useEffect(() => {
+    if (answerSources.length === 0) {
+      setSelectedSourceNums(new Set());
+      return;
+    }
+    if (skipNextSelectionDefaultsRef.current) {
+      skipNextSelectionDefaultsRef.current = false;
+      return;
+    }
+    const defaults = new Set<number>(
+      citedSources.length > 0
+        ? citedSources.map(({ citationNum }) => citationNum)
+        : answerSources.map((_, index) => index + 1)
+    );
+    setSelectedSourceNums(defaults);
+  }, [answerSources, citedSources]);
+
   // Inventory state
   const [inventory, setInventory] = useState<InventorySession[]>([]);
   const [library, setLibrary] = useState<LibraryConversation[]>([]);
@@ -329,6 +414,86 @@ export default function RAGSearch() {
   useEffect(() => {
     ragGetStats().then(setStats);
   }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(KB_HISTORY_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as KBHistoryItem[];
+      if (Array.isArray(parsed)) {
+        setHistory(parsed);
+      }
+    } catch (err) {
+      console.warn('[RAGSearch] Failed to load KB history:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(KB_LAST_STATE_KEY);
+      if (!raw) {
+        hasHydratedLastStateRef.current = true;
+        return;
+      }
+      const parsed = JSON.parse(raw) as Partial<KBLastState>;
+      if (typeof parsed.query === 'string') setQuery(parsed.query);
+      if (parsed.searchMode === 'search' || parsed.searchMode === 'ask') setSearchMode(parsed.searchMode);
+      if (Array.isArray(parsed.results)) setResults(parsed.results as RAGResult[]);
+      if (parsed.answer === null || typeof parsed.answer === 'string') setAnswer(parsed.answer ?? null);
+      if (Array.isArray(parsed.answerSources)) setAnswerSources(parsed.answerSources as RAGResult[]);
+      if (typeof parsed.queryTimeMs === 'number') setQueryTimeMs(parsed.queryTimeMs);
+      if (typeof parsed.total === 'number') setTotal(parsed.total);
+      if (parsed.expandedChunk === null || typeof parsed.expandedChunk === 'string') setExpandedChunk(parsed.expandedChunk ?? null);
+      if (parsed.citationExcerpts && typeof parsed.citationExcerpts === 'object') setCitationExcerpts(parsed.citationExcerpts as Record<string, string>);
+      if (typeof parsed.showUncitedSources === 'boolean') setShowUncitedSources(parsed.showUncitedSources);
+      if (Array.isArray(parsed.selectedSourceNums)) {
+        skipNextSelectionDefaultsRef.current = true;
+        setSelectedSourceNums(new Set(parsed.selectedSourceNums.filter((num): num is number => typeof num === 'number')));
+      }
+    } catch (err) {
+      console.warn('[RAGSearch] Failed to restore last KB state:', err);
+    } finally {
+      hasHydratedLastStateRef.current = true;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hasHydratedLastStateRef.current) return;
+    const hasPersistableResult = answer !== null || results.length > 0 || answerSources.length > 0;
+    if (!hasPersistableResult) return;
+
+    const snapshot: KBLastState = {
+      query,
+      searchMode,
+      results,
+      answer,
+      answerSources,
+      queryTimeMs,
+      total,
+      expandedChunk,
+      citationExcerpts,
+      showUncitedSources,
+      selectedSourceNums: Array.from(selectedSourceNums).sort((a, b) => a - b),
+    };
+
+    try {
+      localStorage.setItem(KB_LAST_STATE_KEY, JSON.stringify(snapshot));
+    } catch (err) {
+      console.warn('[RAGSearch] Failed to persist last KB state:', err);
+    }
+  }, [
+    answer,
+    answerSources,
+    citationExcerpts,
+    expandedChunk,
+    query,
+    queryTimeMs,
+    results,
+    searchMode,
+    selectedSourceNums,
+    showUncitedSources,
+    total,
+  ]);
 
   // Load inventory when switching to inventory tab
   useEffect(() => {
@@ -349,6 +514,32 @@ export default function RAGSearch() {
       setInventoryLoading(false);
     }
   };
+
+  const persistHistory = useCallback((next: KBHistoryItem[]) => {
+    setHistory(next);
+    try {
+      localStorage.setItem(KB_HISTORY_KEY, JSON.stringify(next));
+    } catch (err) {
+      console.warn('[RAGSearch] Failed to persist KB history:', err);
+    }
+  }, []);
+
+  const addHistoryEntry = useCallback((entry: Omit<KBHistoryItem, 'id' | 'createdAt'>) => {
+    const nextEntry: KBHistoryItem = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      createdAt: Date.now(),
+      ...entry,
+    };
+    const next = [
+      nextEntry,
+      ...history.filter((item) => !(item.query === entry.query && item.mode === entry.mode)),
+    ].slice(0, KB_HISTORY_LIMIT);
+    persistHistory(next);
+  }, [history, persistHistory]);
+
+  const clearHistory = useCallback(() => {
+    persistHistory([]);
+  }, [persistHistory]);
 
   const handleCitationClick = useCallback((citationNum: number) => {
     setHighlightedCitation(citationNum);
@@ -371,6 +562,81 @@ export default function RAGSearch() {
     setTimeout(() => setHighlightedCitation(null), 3000);
   }, [answerSources, citedNums]);
 
+  const handleSourceNavigate = useCallback(async (result: RAGResult) => {
+    const sourceMeta = result.sourceMeta;
+    if (sourceMeta?.conversationId) {
+      setMode('library');
+      await selectLibraryConversation(sourceMeta.conversationId);
+      return;
+    }
+
+    const sessionId = sourceMeta?.sessionId || result.chunk.sessionId;
+    if (sessionId) {
+      setMode('observer');
+      await switchToSession(sessionId);
+    }
+  }, [selectLibraryConversation, setMode]);
+
+  const toggleSourceSelection = useCallback((citationNum: number) => {
+    setSelectedSourceNums((prev) => {
+      const next = new Set(prev);
+      if (next.has(citationNum)) next.delete(citationNum);
+      else next.add(citationNum);
+      return next;
+    });
+  }, []);
+
+  const selectAllBootstrapSources = useCallback(() => {
+    setSelectedSourceNums(new Set(answerSources.map((_, index) => index + 1)));
+  }, [answerSources]);
+
+  const deselectAllBootstrapSources = useCallback(() => {
+    setSelectedSourceNums(new Set());
+  }, []);
+
+  const handleStartSessionFromKB = useCallback(async () => {
+    if (!answer) return;
+    const selectedSources = answerSources
+      .map((source, index) => ({ source, citationNum: index + 1 }))
+      .filter(({ citationNum }) => selectedSourceNums.has(citationNum))
+      .map(({ source, citationNum }) => ({
+        sourceType: source.chunk.sourceType as RAGSourceType,
+        sourceId: source.chunk.sourceId,
+        sessionId: source.sourceMeta?.sessionId ?? source.chunk.sessionId ?? null,
+        conversationId: source.sourceMeta?.conversationId ?? null,
+        sourceLabel: source.sourceLabel,
+        sourcePlatform: source.sourceMeta?.sourcePlatform ?? null,
+        excerpt: citationExcerpts[String(citationNum)] || source.snippet || '',
+        sourceCreatedAt: source.sourceMeta?.sourceCreatedAt ?? null,
+        sourceLastActivityAt: source.sourceMeta?.sourceLastActivityAt ?? null,
+        citedAt: source.sourceMeta?.citedAt ?? null,
+      }));
+
+    if (selectedSources.length === 0) return;
+
+    setBootstrappingSession(true);
+    try {
+      const result = await bootstrapSessionFromKB({
+        origin: 'kb',
+        query,
+        answer,
+        citations: citationExcerpts,
+        selectedSources,
+        suggestedTitle: query.trim() || undefined,
+        activeModel: useChatStore.getState().selectedModels[0] ?? null,
+        observerModels: useChatStore.getState().selectedModels.slice(1, 3),
+      });
+      if (!result?.sessionId) throw new Error('Failed to create session');
+      setBootstrapModalOpen(false);
+      setMode('observer');
+      await switchToSession(result.sessionId);
+    } catch (err) {
+      console.error('[RAGSearch] bootstrap session error:', err);
+    } finally {
+      setBootstrappingSession(false);
+    }
+  }, [answer, answerSources, selectedSourceNums, citationExcerpts, query, setMode]);
+
   const handleSubmit = useCallback(async () => {
     if (!query.trim() || loading) return;
     setLoading(true);
@@ -388,6 +654,11 @@ export default function RAGSearch() {
         setResults(res.results ?? []);
         setTotal(res.total ?? 0);
         setQueryTimeMs(res.queryTimeMs ?? 0);
+        addHistoryEntry({
+          query: query.trim(),
+          mode: 'search',
+          resultCount: res.total ?? 0,
+        });
       } else {
         const res = await ragAsk(query.trim());
         if (res) {
@@ -395,6 +666,12 @@ export default function RAGSearch() {
           setAnswerSources(res.sources ?? []);
           setCitationExcerpts(res.citations ?? {});
           setQueryTimeMs(res.queryTimeMs ?? 0);
+          addHistoryEntry({
+            query: query.trim(),
+            mode: 'ask',
+            resultCount: (res.sources ?? []).length,
+            answerPreview: (res.answer ?? '').slice(0, 140),
+          });
         }
       }
     } catch (err) {
@@ -402,7 +679,7 @@ export default function RAGSearch() {
     } finally {
       setLoading(false);
     }
-  }, [query, searchMode, loading]);
+  }, [query, searchMode, loading, addHistoryEntry]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -498,6 +775,72 @@ export default function RAGSearch() {
   const unindexedLibrary = totalLibrary - indexedLibrary;
   const totalUnindexed = unindexedFiles + unindexedLibrary;
 
+  const canNavigateToSource = useCallback((result: RAGResult) => {
+    return Boolean(result.sourceMeta?.conversationId || result.sourceMeta?.sessionId || result.chunk.sessionId);
+  }, []);
+
+  const renderSourceMetadata = useCallback((result: RAGResult, variant: 'default' | 'inline' = 'default') => {
+    const meta = result.sourceMeta;
+    if (!meta) return null;
+
+    const rows: string[] = [];
+    const citedAt = formatMaybeDate(meta.citedAt);
+    const createdAt = formatMaybeDate(meta.sourceCreatedAt);
+    const lastActivityAt = formatMaybeDate(meta.sourceLastActivityAt);
+    const updatedAt = formatMaybeDate(meta.sourceUpdatedAt);
+    const syncedAt = formatMaybeDate(meta.sourceSyncedAt);
+
+    if (meta.projectName) rows.push(`Project: ${meta.projectName}`);
+    if (meta.workspaceName) rows.push(`Workspace: ${meta.workspaceName}`);
+    if (meta.model) rows.push(`Model: ${meta.model}`);
+    if (citedAt) rows.push(`Cited discussion: ${citedAt}`);
+    if (createdAt) rows.push(`Started: ${createdAt}`);
+    if (lastActivityAt) rows.push(`Last discussed: ${lastActivityAt}`);
+    if (!lastActivityAt && updatedAt) rows.push(`Last updated: ${updatedAt}`);
+    if (syncedAt) rows.push(`Synced to Prism: ${syncedAt}`);
+
+    if (rows.length === 0) return null;
+
+    return (
+      <div className={`flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-gray-500 ${variant === 'inline' ? '' : 'mt-2'}`}>
+        {rows.map((row) => (
+          <span key={row}>{row}</span>
+        ))}
+      </div>
+    );
+  }, []);
+
+  const renderBootstrapSourceMetadata = useCallback((source: RAGResult, citationNum: number) => {
+    const meta = source.sourceMeta;
+    if (!meta) return null;
+
+    const rows: string[] = [];
+    const citedAt = formatMaybeDate(meta.citedAt);
+    const createdAt = formatMaybeDate(meta.sourceCreatedAt);
+    const lastActivityAt = formatMaybeDate(meta.sourceLastActivityAt);
+    const updatedAt = formatMaybeDate(meta.sourceUpdatedAt);
+    const syncedAt = formatMaybeDate(meta.sourceSyncedAt);
+
+    if (meta.projectName) rows.push(`Project: ${meta.projectName}`);
+    if (meta.workspaceName) rows.push(`Workspace: ${meta.workspaceName}`);
+    if (meta.model) rows.push(`Model: ${meta.model}`);
+    if (citedAt) rows.push(`Cited discussion: ${citedAt}`);
+    if (createdAt) rows.push(`Started: ${createdAt}`);
+    if (lastActivityAt) rows.push(`Last discussed: ${lastActivityAt}`);
+    if (!lastActivityAt && updatedAt) rows.push(`Last updated: ${updatedAt}`);
+    if (syncedAt) rows.push(`Synced to Prism: ${syncedAt}`);
+
+    if (rows.length === 0) return null;
+
+    return (
+      <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-gray-500">
+        {rows.map((row) => (
+          <span key={`${citationNum}-${row}`}>{row}</span>
+        ))}
+      </div>
+    );
+  }, []);
+
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {/* Header */}
@@ -586,6 +929,54 @@ export default function RAGSearch() {
             </button>
           </div>
 
+          {history.length > 0 && (
+            <div className="mb-4 rounded-xl border border-gray-700 bg-gray-800/30 p-3">
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-[10px] uppercase tracking-wider text-gray-500 font-medium">
+                  Recent History
+                </div>
+                <button
+                  onClick={clearHistory}
+                  className="text-[10px] text-gray-500 hover:text-gray-300 transition-colors"
+                >
+                  Clear
+                </button>
+              </div>
+              <div className="space-y-1.5">
+                {history.map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => {
+                      setQuery(item.query);
+                      setSearchMode(item.mode);
+                      inputRef.current?.focus();
+                    }}
+                    className="w-full text-left rounded-lg px-2.5 py-2 hover:bg-gray-700/40 transition-colors"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                        item.mode === 'ask'
+                          ? 'bg-indigo-900/50 text-indigo-300'
+                          : 'bg-gray-700 text-gray-300'
+                      }`}>
+                        {item.mode === 'ask' ? 'Ask' : 'Search'}
+                      </span>
+                      <span className="text-xs text-gray-200 truncate">{item.query}</span>
+                      <span className="ml-auto text-[10px] text-gray-500">
+                        {formatDate(item.createdAt)}
+                      </span>
+                    </div>
+                    {(item.answerPreview || item.resultCount !== undefined) && (
+                      <div className="mt-1 text-[10px] text-gray-500 truncate">
+                        {item.answerPreview || `${item.resultCount} result${item.resultCount === 1 ? '' : 's'}`}
+                      </div>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Results Area */}
           <div className="flex-1 overflow-y-auto space-y-3">
             {/* Q&A Answer */}
@@ -594,6 +985,15 @@ export default function RAGSearch() {
                 <div className="flex items-center gap-2 mb-3">
                   <span className="text-indigo-400 text-sm font-medium">Answer</span>
                   <span className="text-xs text-gray-500">{queryTimeMs}ms</span>
+                  <div className="ml-auto">
+                    <button
+                      onClick={() => setBootstrapModalOpen(true)}
+                      disabled={selectedSourceNums.size === 0}
+                      className="px-2.5 py-1 text-[11px] rounded bg-emerald-700 hover:bg-emerald-600 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Start Session
+                    </button>
+                  </div>
                 </div>
                 <div className="text-sm text-gray-200 leading-relaxed">
                   <MarkdownWithCitations
@@ -638,6 +1038,16 @@ export default function RAGSearch() {
                                   onClick={() => setExpandedChunk(isExpanded ? null : r.chunk.id)}
                                   className="w-full text-left flex items-center gap-2 px-2 py-1.5"
                                 >
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedSourceNums.has(citationNum)}
+                                    onChange={(event) => {
+                                      event.stopPropagation();
+                                      toggleSourceSelection(citationNum);
+                                    }}
+                                    onClick={(event) => event.stopPropagation()}
+                                    className="accent-emerald-500"
+                                  />
                                   <span className={`inline-flex items-center justify-center w-5 h-5 text-[10px] font-bold rounded ${
                                     isHighlighted ? 'bg-indigo-500 text-white' : 'bg-indigo-700 text-indigo-200'
                                   }`}>
@@ -648,8 +1058,21 @@ export default function RAGSearch() {
                                   <span className="text-[10px] text-gray-500">{(r.score * 100).toFixed(0)}%</span>
                                   <span className="text-[10px] text-gray-600">{isExpanded ? '\u25B2' : '\u25BC'}</span>
                                 </button>
+                                <div className="px-9 pb-2 pr-6">
+                                  {renderSourceMetadata(r, 'inline')}
+                                </div>
                                 {isExpanded && (
                                   <div className="px-3 pb-2 pt-1 ml-7">
+                                    {canNavigateToSource(r) && (
+                                      <div className="flex justify-end mb-2">
+                                        <button
+                                          onClick={() => { void handleSourceNavigate(r); }}
+                                          className="text-[10px] px-2 py-1 rounded bg-gray-700 text-gray-200 hover:bg-gray-600 transition-colors"
+                                        >
+                                          Open in {r.sourceMeta?.conversationId ? 'Library' : 'Session'}
+                                        </button>
+                                      </div>
+                                    )}
                                     {citationExcerpts[String(citationNum)] && (
                                       <div className="mb-2 px-3 py-2 rounded-md bg-indigo-900/30 border-l-2 border-indigo-400">
                                         <div className="text-[10px] text-indigo-400 font-medium mb-1 uppercase tracking-wider">Cited excerpt</div>
@@ -701,6 +1124,16 @@ export default function RAGSearch() {
                                     onClick={() => setExpandedChunk(isExpanded ? null : r.chunk.id)}
                                     className="w-full text-left flex items-center gap-2 px-2 py-1"
                                   >
+                                    <input
+                                      type="checkbox"
+                                      checked={selectedSourceNums.has(citationNum)}
+                                      onChange={(event) => {
+                                        event.stopPropagation();
+                                        toggleSourceSelection(citationNum);
+                                      }}
+                                      onClick={(event) => event.stopPropagation()}
+                                      className="accent-emerald-500"
+                                    />
                                     <span className="inline-flex items-center justify-center w-5 h-5 text-[10px] font-bold rounded bg-gray-800 text-gray-500">
                                       {citationNum}
                                     </span>
@@ -709,8 +1142,21 @@ export default function RAGSearch() {
                                     <span className="text-[10px] text-gray-600">{(r.score * 100).toFixed(0)}%</span>
                                     <span className="text-[10px] text-gray-600">{isExpanded ? '\u25B2' : '\u25BC'}</span>
                                   </button>
+                                  <div className="px-9 pb-2 pr-6">
+                                    {renderSourceMetadata(r, 'inline')}
+                                  </div>
                                   {isExpanded && (
                                     <div className="px-3 pb-2 pt-1 ml-7">
+                                      {canNavigateToSource(r) && (
+                                        <div className="flex justify-end mb-2">
+                                          <button
+                                            onClick={() => { void handleSourceNavigate(r); }}
+                                            className="text-[10px] px-2 py-1 rounded bg-gray-700 text-gray-200 hover:bg-gray-600 transition-colors"
+                                          >
+                                            Open in {r.sourceMeta?.conversationId ? 'Library' : 'Session'}
+                                          </button>
+                                        </div>
+                                      )}
                                       <div className="text-xs text-gray-500 leading-relaxed whitespace-pre-wrap border-l-2 border-gray-700/50 pl-3">
                                         {r.chunk.content}
                                       </div>
@@ -747,10 +1193,19 @@ export default function RAGSearch() {
                     <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${badge.cls}`}>
                       {badge.label}
                     </span>
+                    {canNavigateToSource(r) && (
+                      <button
+                        onClick={() => { void handleSourceNavigate(r); }}
+                        className="text-[10px] px-2 py-0.5 rounded bg-gray-700 text-gray-200 hover:bg-gray-600 transition-colors"
+                      >
+                        Open
+                      </button>
+                    )}
                     <span className="text-[10px] text-gray-500 ml-auto">
                       Score: {r.score.toFixed(3)}
                     </span>
                   </div>
+                  {renderSourceMetadata(r)}
 
                   <div
                     className={`text-xs text-gray-400 leading-relaxed ${isExpanded ? '' : 'line-clamp-3'}`}
@@ -1046,6 +1501,118 @@ export default function RAGSearch() {
               </div>
             </>
           )}
+        </div>
+      )}
+
+      {bootstrapModalOpen && answer !== null && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="w-full max-w-2xl rounded-xl border border-gray-700 bg-gray-900 p-5 shadow-2xl">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-100">Start Session from KB</h3>
+                <p className="text-xs text-gray-500 mt-1">A new topic session will start from this KB answer and the selected cited sources.</p>
+              </div>
+              <button
+                onClick={() => setBootstrapModalOpen(false)}
+                className="text-gray-500 hover:text-gray-300 text-xl"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">Session title</div>
+                <div className="text-sm text-gray-200">{query || 'KB Follow-up Session'}</div>
+              </div>
+
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">Original question</div>
+                <div className="rounded-lg bg-gray-800/70 px-3 py-2 text-xs text-gray-300">{query}</div>
+              </div>
+
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1">KB summary</div>
+                <div className="max-h-40 overflow-y-auto rounded-lg bg-gray-800/70 px-3 py-2 text-xs text-gray-300 whitespace-pre-wrap">
+                  {answer}
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-emerald-900/50 bg-emerald-950/20 px-3 py-2 text-xs text-gray-300">
+                <div className="text-[10px] uppercase tracking-wider text-emerald-300 mb-1">What this new session will include</div>
+                <div className="space-y-1 text-gray-400">
+                  <div>1. The original KB question</div>
+                  <div>2. The KB answer summary above</div>
+                  <div>3. The selected cited source excerpts below, with their timestamps and references</div>
+                </div>
+              </div>
+
+              <div>
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <div className="text-[10px] uppercase tracking-wider text-gray-500">
+                    Selected cited sources ({selectedSourceNums.size}/{answerSources.length})
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={selectAllBootstrapSources}
+                      className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 transition-colors hover:bg-gray-800"
+                    >
+                      Select All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={deselectAllBootstrapSources}
+                      className="rounded border border-gray-700 px-2 py-1 text-[10px] text-gray-300 transition-colors hover:bg-gray-800"
+                    >
+                      Deselect All
+                    </button>
+                  </div>
+                </div>
+                <div className="max-h-48 space-y-2 overflow-y-auto pr-1">
+                  {answerSources.map((source, index) => {
+                    const citationNum = index + 1;
+                    return (
+                      <label
+                        key={source.chunk.id}
+                        className="flex items-start gap-3 rounded-lg border border-gray-800 bg-gray-800/50 px-3 py-2"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedSourceNums.has(citationNum)}
+                          onChange={() => toggleSourceSelection(citationNum)}
+                          className="mt-0.5 accent-emerald-500"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs text-gray-200">{source.sourceLabel}</div>
+                          {renderBootstrapSourceMetadata(source, citationNum)}
+                          <div className="mt-1 text-[11px] text-gray-400 line-clamp-3">
+                            {citationExcerpts[String(citationNum)] || source.snippet}
+                          </div>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setBootstrapModalOpen(false)}
+                className="px-3 py-2 text-sm rounded border border-gray-700 text-gray-300 hover:bg-gray-800"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => void handleStartSessionFromKB()}
+                disabled={selectedSourceNums.size === 0 || bootstrappingSession}
+                className="px-3 py-2 text-sm rounded bg-emerald-700 text-white hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {bootstrappingSession ? 'Creating...' : 'Create Session'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

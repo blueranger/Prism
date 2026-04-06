@@ -6,6 +6,16 @@ export const MODELS: Record<string, ModelConfig> = {
   // ═══════════════════════════════════════════
 
   // GPT-5 series
+  'gpt-5.4': {
+    provider: 'openai',
+    model: 'gpt-5.4',
+    displayName: 'GPT-5.4',
+    maxTokens: 128000,
+    inputCostPer1M: 1.75,
+    outputCostPer1M: 14.0,
+    description: 'Preferred flagship, supports reasoning effort',
+    supportsThinking: true,
+  },
   'gpt-5.2': {
     provider: 'openai',
     model: 'gpt-5.2',
@@ -252,7 +262,7 @@ export const MODELS: Record<string, ModelConfig> = {
 /** Maximum number of models that can be selected simultaneously */
 export const MAX_SELECTED_MODELS = 3;
 
-export const DEFAULT_MODELS = ['gpt-5.2', 'claude-sonnet-4-6', 'gemini-2.5-flash'];
+export const DEFAULT_MODELS = ['gpt-5.4', 'claude-opus-4-6', 'gemini-3.1-pro-preview'];
 
 /** How many tokens to reserve for the model's response */
 export const RESPONSE_TOKEN_RESERVE = 4096;

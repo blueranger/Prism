@@ -76,7 +76,7 @@ export default function ContextualHintsPanel() {
   const handleMentionClick = useCallback((mention: EntityMention) => {
     const store = useChatStore.getState();
     if (mention.sessionId) {
-      store.setMode('parallel');
+      store.setMode('observer');
       store.switchSession(mention.sessionId);
     } else if (mention.conversationId) {
       store.setMode('library');

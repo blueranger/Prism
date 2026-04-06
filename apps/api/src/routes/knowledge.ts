@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { extractionService } from '../services/extraction-service';
+import { listRelationshipEvidence } from '../memory/relationship-routing-store';
 import {
   listTags, getConversationsByTag,
   listEntities, getEntityDetail,
@@ -83,6 +84,12 @@ router.get('/graph', (req, res) => {
     maxNodes: req.query.maxNodes ? parseInt(req.query.maxNodes as string) : undefined,
   });
   res.json(data);
+});
+
+router.get('/relations', (req, res) => {
+  const routingDecision = typeof req.query.routingDecision === 'string' ? (req.query.routingDecision as any) : 'all';
+  const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 100;
+  res.json({ relations: listRelationshipEvidence({ routingDecision, limit }) });
 });
 
 // GET /api/knowledge/stats — Get knowledge graph statistics

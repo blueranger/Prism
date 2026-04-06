@@ -2,11 +2,12 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useChatStore } from '@/stores/chat-store';
-import { restoreSession, fetchSessionLinks } from '@/lib/api';
+import { restoreSession, fetchSessionLinks, createSession, fetchSessionApi } from '@/lib/api';
 import { MODELS, MAX_SELECTED_MODELS, DEFAULT_MODELS } from '@prism/shared';
 import { useCommWebSocket } from '@/lib/useCommWebSocket';
 import ModelSelector from '@/components/ModelSelector';
 import ModeSelector from '@/components/ModeSelector';
+import ObserverPanel from '@/components/ObserverPanel';
 import ParallelView from '@/components/ParallelView';
 import HandoffPanel from '@/components/HandoffPanel';
 import ComparePanel from '@/components/ComparePanel';
@@ -18,28 +19,42 @@ import SessionOutline from '@/components/SessionOutline';
 import ConversationKnowledge from '@/components/ConversationKnowledge';
 import PromptInput from '@/components/PromptInput';
 import SessionDrawer from '@/components/SessionDrawer';
+import TopicActionsPanel from '@/components/TopicActionsPanel';
 import SessionLinkPicker from '@/components/SessionLinkPicker';
 import LinkedSessionsBadge from '@/components/LinkedSessionsBadge';
 import CommunicationView from '@/components/CommunicationView';
 import CommNotificationBadge from '@/components/CommNotificationBadge';
 import LibraryView from '@/components/LibraryView';
 import KnowledgeView from '@/components/KnowledgeView';
+import MemoryView from '@/components/MemoryView';
+import TriggerView from '@/components/TriggerView';
+import CostsView from '@/components/CostsView';
 import ProvenanceView from '@/components/ProvenanceView';
 import RAGSearch from '@/components/RAGSearch';
 import SearchBar from '@/components/SearchBar';
 import SearchResults from '@/components/SearchResults';
 import NotionPagePicker from '@/components/NotionPagePicker';
 import NotionSourceBadge from '@/components/NotionSourceBadge';
+import SessionBootstrapBanner from '@/components/SessionBootstrapBanner';
+import SessionCostBanner from '@/components/SessionCostBanner';
 
 export default function Home() {
   const mode = useChatStore((s) => s.mode);
   const timeline = useChatStore((s) => s.timeline);
   const sessionId = useChatStore((s) => s.sessionId);
+  const currentSession = useChatStore((s) => s.currentSession);
   const searchQuery = useChatStore((s) => s.searchQuery);
   const outlineTab = useChatStore((s) => s.outlineTab);
   const notionContextSources = useChatStore((s) => s.notionContextSources);
   const notionPickerOpen = useChatStore((s) => s.notionPickerOpen);
   const knowledgeHintsEnabled = useChatStore((s) => s.knowledgeHintsEnabled);
+  const modelRecommendationsEnabled = useChatStore((s) => s.modelRecommendationsEnabled);
+  const setSessionId = useChatStore((s) => s.setSessionId);
+  const setCurrentSession = useChatStore((s) => s.setCurrentSession);
+  const setNotionPickerOpen = useChatStore((s) => s.setNotionPickerOpen);
+  const fetchNotionContextSources = useChatStore((s) => s.fetchNotionContextSources);
+  const [leftPanelHidden, setLeftPanelHidden] = useState(false);
+  const [rightPanelHidden, setRightPanelHidden] = useState(false);
 
   // Resizable sidebar width
   const [sidebarWidth, setSidebarWidth] = useState(320);
@@ -70,6 +85,18 @@ export default function Home() {
   // Connect to backend WebSocket for real-time notifications
   useCommWebSocket();
 
+  useEffect(() => {
+    try {
+      setLeftPanelHidden(localStorage.getItem('prism_leftPanelHidden') === 'true');
+      setRightPanelHidden(localStorage.getItem('prism_rightPanelHidden') === 'true');
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    if ((mode !== 'parallel' && mode !== 'observer') || !sessionId) return;
+    restoreSession(sessionId);
+  }, [mode, sessionId]);
+
   // Restore session from localStorage on page load
   useEffect(() => {
     const stored = localStorage.getItem('prism_sessionId');
@@ -94,12 +121,45 @@ export default function Home() {
         }
       }
     } catch {}
+
+    try {
+      const saved = localStorage.getItem('prism_modelRecommendationsEnabled');
+      if (saved !== null) {
+        useChatStore.getState().setModelRecommendationsEnabled(JSON.parse(saved) === true);
+      }
+    } catch {}
   }, []);
 
+  const handleOpenNotionPicker = useCallback(async () => {
+    let activeSessionId = sessionId;
+    if (!activeSessionId) {
+      activeSessionId = await createSession();
+      if (!activeSessionId) return;
+      setSessionId(activeSessionId);
+      const session = await fetchSessionApi(activeSessionId);
+      setCurrentSession(session);
+    }
+
+    await fetchNotionContextSources(activeSessionId);
+    setNotionPickerOpen(true);
+  }, [fetchNotionContextSources, sessionId, setCurrentSession, setNotionPickerOpen, setSessionId]);
+
   const showTimeline = timeline.length > 0;
+  const canShowSidePanels = mode !== 'flow' && mode !== 'communication' && mode !== 'library' && mode !== 'knowledge' && mode !== 'memory' && mode !== 'triggers' && mode !== 'costs' && mode !== 'provenance' && mode !== 'rag';
+  const canShowRightActions = canShowSidePanels && mode !== 'observer';
+
+  const toggleLeftPanel = useCallback((hidden: boolean) => {
+    setLeftPanelHidden(hidden);
+    try { localStorage.setItem('prism_leftPanelHidden', String(hidden)); } catch {}
+  }, []);
+
+  const toggleRightPanel = useCallback((hidden: boolean) => {
+    setRightPanelHidden(hidden);
+    try { localStorage.setItem('prism_rightPanelHidden', String(hidden)); } catch {}
+  }, []);
 
   return (
-    <div className="h-screen flex flex-col p-4 gap-4">
+    <div className="h-screen overflow-hidden flex flex-col p-4 gap-4">
       {/* Header */}
       <header className="flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
@@ -107,7 +167,10 @@ export default function Home() {
             Prism
           </h1>
           <button
-            onClick={() => useChatStore.getState().newSession()}
+            onClick={() => {
+              useChatStore.getState().newSession();
+              useChatStore.getState().setMode('observer');
+            }}
             className="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600 text-gray-300 border border-gray-600 transition-colors"
           >
             + New
@@ -129,14 +192,37 @@ export default function Home() {
       </header>
 
       {/* Main content area */}
-      <div className="flex-1 flex gap-4 min-h-0">
+      <div className="relative flex-1 min-h-0">
+        {showTimeline && canShowSidePanels && leftPanelHidden && (
+          <div className="pointer-events-none absolute left-0 top-0 z-20">
+            <button
+              onClick={() => toggleLeftPanel(false)}
+              className="pointer-events-auto rounded-lg border border-gray-800 bg-gray-900/90 px-3 py-2 text-xs text-gray-300 shadow-lg backdrop-blur transition-colors hover:bg-gray-800"
+            >
+              Show Timeline
+            </button>
+          </div>
+        )}
+
+        {sessionId && currentSession && canShowRightActions && rightPanelHidden && (
+          <div className="pointer-events-none absolute right-0 top-0 z-20">
+            <button
+              onClick={() => toggleRightPanel(false)}
+              className="pointer-events-auto rounded-lg border border-gray-800 bg-gray-900/90 px-3 py-2 text-xs text-gray-300 shadow-lg backdrop-blur transition-colors hover:bg-gray-800"
+            >
+              Show Actions
+            </button>
+          </div>
+        )}
+
+        <div className="flex h-full gap-4 min-h-0">
         {searchQuery ? (
           /* Search results overlay */
           <SearchResults />
         ) : (
           <>
             {/* Timeline sidebar (shows when there's history, hidden in flow/communication/library/knowledge/provenance/rag modes) */}
-            {showTimeline && mode !== 'flow' && mode !== 'communication' && mode !== 'library' && mode !== 'knowledge' && mode !== 'provenance' && mode !== 'rag' && (
+            {showTimeline && canShowSidePanels && !leftPanelHidden && (
               <div className="flex-shrink-0 flex flex-row min-h-0" style={{ width: sidebarWidth }}>
               <div className="flex-1 flex flex-col min-h-0 min-w-0 pr-2">
                 <div className="flex items-center gap-2 mb-3">
@@ -175,6 +261,12 @@ export default function Home() {
                     }`}
                   >
                     Knowledge
+                  </button>
+                  <button
+                    onClick={() => toggleLeftPanel(true)}
+                    className="ml-auto rounded border border-gray-700 px-2 py-1 text-[10px] uppercase tracking-wide text-gray-400 transition-colors hover:bg-gray-800 hover:text-gray-200"
+                  >
+                    Hide
                   </button>
                 </div>
                 {outlineTab === 'timeline' ? (
@@ -216,7 +308,12 @@ export default function Home() {
             )}
 
             {/* Active view */}
-            <div className="flex-1 flex flex-col gap-4 min-h-0">
+            <div className="flex-1 flex flex-col gap-4 min-h-0 overflow-hidden">
+              {(mode === 'parallel' || mode === 'observer') && sessionId && currentSession?.sessionType === 'topic' && (
+                <SessionBootstrapBanner sessionId={sessionId} />
+              )}
+              {sessionId && canShowSidePanels && <SessionCostBanner sessionId={sessionId} />}
+              {mode === 'observer' && <ObserverPanel />}
               {mode === 'parallel' && <ParallelView />}
               {mode === 'handoff' && <HandoffPanel />}
               {mode === 'compare' && <ComparePanel />}
@@ -226,15 +323,24 @@ export default function Home() {
               {mode === 'communication' && <CommunicationView />}
               {mode === 'library' && <LibraryView />}
               {mode === 'knowledge' && <KnowledgeView />}
+              {mode === 'memory' && <MemoryView />}
+              {mode === 'triggers' && <TriggerView />}
+              {mode === 'costs' && <CostsView />}
               {mode === 'provenance' && <ProvenanceView />}
               {mode === 'rag' && <RAGSearch />}
             </div>
+
+            {sessionId && currentSession && canShowRightActions && !rightPanelHidden && (
+              <TopicActionsPanel onHide={() => toggleRightPanel(true)} />
+            )}
+
           </>
         )}
+        </div>
       </div>
 
       {/* Notion context sources bar + prompt input */}
-      {(mode === 'parallel' || mode === 'communication') && (
+      {(mode === 'observer' || mode === 'parallel' || mode === 'communication') && (
         <div className="flex flex-col gap-2">
           {/* Notion attached sources */}
           {sessionId && notionContextSources.length > 0 && (
@@ -244,16 +350,35 @@ export default function Home() {
               ))}
             </div>
           )}
-          <div className="flex items-center gap-2">
-            {sessionId && (
+          <div className="flex items-end gap-2">
+            <div className="flex flex-col gap-2">
               <button
-                onClick={() => useChatStore.getState().setNotionPickerOpen(true)}
+                onClick={() => { void handleOpenNotionPicker(); }}
                 className="px-2 py-1.5 text-xs rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-gray-200 border border-gray-700 transition-colors whitespace-nowrap"
                 title="Attach Notion page as context"
               >
                 📄 Notion
               </button>
-            )}
+              <button
+                onClick={() => useChatStore.getState().setModelRecommendationsEnabled(!modelRecommendationsEnabled)}
+                aria-pressed={modelRecommendationsEnabled}
+                className={`flex items-center justify-between gap-2 rounded border px-2 py-1.5 text-xs transition-colors whitespace-nowrap ${
+                  modelRecommendationsEnabled
+                    ? 'bg-indigo-900/30 hover:bg-indigo-900/50 text-indigo-300 border-indigo-700'
+                    : 'bg-gray-800 hover:bg-gray-700 text-gray-500 border-gray-700'
+                }`}
+                title={modelRecommendationsEnabled ? 'Model Recommendations: ON — click to disable' : 'Model Recommendations: OFF — click to enable'}
+              >
+                <span className="font-medium">AI Rec</span>
+                <span className={`relative h-4 w-8 rounded-full transition-colors ${modelRecommendationsEnabled ? 'bg-indigo-500/70' : 'bg-gray-700'}`}>
+                  <span
+                    className={`absolute top-[2px] h-3 w-3 rounded-full bg-white transition-transform ${
+                      modelRecommendationsEnabled ? 'translate-x-4' : 'translate-x-1'
+                    }`}
+                  />
+                </span>
+              </button>
+            </div>
             <button
               onClick={() => useChatStore.getState().setKnowledgeHintsEnabled(!knowledgeHintsEnabled)}
               className={`px-2 py-1.5 text-xs rounded border transition-colors whitespace-nowrap ${

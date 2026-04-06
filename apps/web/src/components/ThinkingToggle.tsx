@@ -23,7 +23,7 @@ const BUDGET_PRESETS = [
  * Google models: shows thinking budget slider (0-24576 tokens)
  */
 export default function ThinkingToggle({ modelId }: { modelId: string }) {
-  const config = MODELS[modelId];
+  const config = resolveThinkingModelConfig(modelId);
   if (!config?.supportsThinking) return null;
 
   const thinkingConfig = useChatStore((s) => s.thinkingConfig[modelId]);
@@ -82,6 +82,34 @@ export default function ThinkingToggle({ modelId }: { modelId: string }) {
       )}
     </div>
   );
+}
+
+function resolveThinkingModelConfig(modelId: string) {
+  const staticConfig = MODELS[modelId];
+  if (staticConfig) return staticConfig;
+
+  const provider =
+    modelId.startsWith('gpt-') || /^o[1345](?:-|$)/.test(modelId)
+      ? 'openai'
+      : modelId.startsWith('gemini-')
+        ? 'google'
+        : modelId.startsWith('claude-')
+          ? 'anthropic'
+          : null;
+
+  if (!provider) return null;
+
+  const supportsThinking =
+    provider === 'openai'
+      ? modelId.startsWith('gpt-5') || /^o[1345](?:-|$)/.test(modelId)
+      : provider === 'google'
+        ? /^gemini-(?:2\.5|3)/.test(modelId)
+        : false;
+
+  return {
+    provider,
+    supportsThinking,
+  } as const;
 }
 
 function OpenAIEffortSelector({ modelId }: { modelId: string }) {

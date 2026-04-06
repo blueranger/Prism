@@ -1,8 +1,62 @@
 import { useChatStore } from '@/stores/chat-store';
 import type { AgentPlanStep } from '@/stores/chat-store';
-import type { TimelineEntry, AgentTask, FlowGraph, Session, SessionLink, Decision, DecisionType, ClassificationResult, ConnectorStatus, ExternalThread, ExternalMessage, DraftReply, SenderLearningStats, MonitorRule, MonitorRuleConditions, MonitorAction, MonitorRuleActionConfig, CommProvider, UploadedFile } from '@prism/shared';
+import type { TimelineEntry, AgentTask, FlowGraph, ObserverConfig, ObserverSnapshot, Session, SessionLink, Decision, DecisionType, ClassificationResult, ConnectorStatus, ExternalThread, ExternalMessage, DraftReply, SenderLearningStats, MonitorRule, MonitorRuleConditions, MonitorAction, MonitorRuleActionConfig, CommProvider, UploadedFile, CreateActionRequest, ActionStatus, UrlPreview, WebPagePreviewResponse, WebPageRef, ContextDebugInfo, ChatGPTSyncConversation, ClaudeSyncConversation, GeminiSyncConversation, ImportProjectTarget, ImportProgress, KBSessionBootstrapRequest, KBSessionBootstrapResponse, ObserverActionType, SessionBootstrapRecord, ManualPreviewRequest, RichPreviewArtifact, MemoryCandidate, MemoryGraphEdge, MemoryGraphNode, MemoryItem, MemoryTimelineEvent, MemoryType, MemoryExtractionRun, MemoryExtractionRunItem, MemoryUsageRun, MemoryUsageRunItem, WorkingMemoryItem, MemoryInjectionPreview, TriggerCandidate, TriggerNotification, TriggerRule, TriggerRun, RelationshipEvidence, LLMCostSummary, LLMUsageEvent, ProviderCostRecord } from '@prism/shared';
+import type { ImportSyncRun } from '@prism/shared';
+import { MODELS } from '@prism/shared';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+const SOFT_STALL_MS = 20_000;
+const HARD_STALL_MS = 45_000;
+let activeStreamAbortController: AbortController | null = null;
+let activeStallTimer: ReturnType<typeof setInterval> | null = null;
+
+function clearActiveStreamWatch() {
+  if (activeStallTimer) {
+    clearInterval(activeStallTimer);
+    activeStallTimer = null;
+  }
+  activeStreamAbortController = null;
+}
+
+function startActiveStreamWatch(
+  target: 'observer' | 'parallel' | 'compare' | 'synthesize' | 'handoff',
+  models: string[],
+  controller: AbortController,
+) {
+  clearActiveStreamWatch();
+  activeStreamAbortController = controller;
+  activeStallTimer = setInterval(() => {
+    const store = useChatStore.getState();
+    const responseMap =
+      target === 'observer'
+        ? store.observerResponses
+        : target === 'compare'
+        ? store.compareResponses
+        : target === 'synthesize'
+          ? store.synthesizeResponses
+          : target === 'handoff'
+            ? store.handoffResponses
+            : store.parallelResponses;
+    const now = Date.now();
+    for (const model of models) {
+      const resp = responseMap[model];
+      if (!resp || resp.done) continue;
+      const lastChunkAt = resp.lastChunkAt ?? now;
+      const idleFor = now - lastChunkAt;
+      if (idleFor >= SOFT_STALL_MS && resp.streamStatus !== 'stalled') {
+        store.markStalled(model, { target, retryable: false });
+      }
+      if (target !== 'parallel' && idleFor >= HARD_STALL_MS) {
+        store.markStalled(model, {
+          target,
+          retryable: true,
+          partialRetained: Boolean(resp.content),
+          error: 'Streaming stalled',
+        });
+      }
+    }
+  }, 1000);
+}
 
 /**
  * Parse an SSE stream and dispatch chunks to the store.
@@ -16,15 +70,26 @@ async function consumeSSE(response: Response) {
     try {
       const errData = await response.json();
       const errMsg = errData?.error ?? `HTTP ${response.status}`;
+      const targetResponses =
+        store.activeStreamTarget === 'observer'
+          ? store.observerResponses
+          : store.activeStreamTarget === 'compare'
+          ? store.compareResponses
+          : store.activeStreamTarget === 'synthesize'
+            ? store.synthesizeResponses
+            : store.activeStreamTarget === 'handoff'
+              ? store.handoffResponses
+              : store.parallelResponses;
       // Mark all streaming models as errored
-      for (const key of Object.keys(store.responses)) {
-        if (!store.responses[key].done) {
+      for (const key of Object.keys(targetResponses)) {
+        if (!targetResponses[key].done) {
           store.markDone(key, errMsg);
         }
       }
     } catch {
       // Can't parse error body
     }
+    clearActiveStreamWatch();
     store.finishStreaming();
     return;
   }
@@ -53,10 +118,43 @@ async function consumeSSE(response: Response) {
 
       if (data === '[DONE]') {
         console.log(`[consumeSSE] [DONE] received, ${totalChunks} chunks processed`);
-        store.finishStreaming();
+        const latestStore = useChatStore.getState();
+        const targetResponses =
+          latestStore.activeStreamTarget === 'observer'
+            ? latestStore.observerResponses
+            : latestStore.activeStreamTarget === 'compare'
+            ? latestStore.compareResponses
+            : latestStore.activeStreamTarget === 'synthesize'
+              ? latestStore.synthesizeResponses
+              : latestStore.activeStreamTarget === 'handoff'
+                ? latestStore.handoffResponses
+                : latestStore.parallelResponses;
+        for (const key of Object.keys(targetResponses)) {
+          const response = targetResponses[key];
+          const shouldForceComplete =
+            !response.done ||
+            (
+              response.streamStatus === 'stalled' &&
+              Boolean(response.content) &&
+              !response.stopReason &&
+              (!response.error || /streaming stalled/i.test(response.error))
+            );
+          if (shouldForceComplete) {
+            store.markDone(key, undefined, {
+              promptTokens: response.promptTokens,
+              completionTokens: response.completionTokens,
+              reasoningTokens: response.reasoningTokens,
+              cachedTokens: response.cachedTokens,
+              estimatedCostUsd: response.estimatedCostUsd,
+              pricingSource: response.pricingSource,
+            });
+          }
+        }
+        clearActiveStreamWatch();
+        latestStore.finishStreaming();
         // Refresh timeline after streaming completes
-        if (store.sessionId) {
-          fetchTimeline(store.sessionId);
+        if (latestStore.sessionId) {
+          void fetchTimeline(latestStore.sessionId);
         }
         return;
       }
@@ -74,6 +172,11 @@ async function consumeSSE(response: Response) {
           continue;
         }
 
+        if (parsed.type === 'context_debug') {
+          store.setLastContextDebug((parsed.byModel ?? null) as Record<string, ContextDebugInfo> | null);
+          continue;
+        }
+
         if (parsed.type === 'handoff' || parsed.type === 'compare_start' || parsed.type === 'synthesize_start') {
           if (parsed.type === 'compare_start' && parsed.originContent) {
             store.setCompareOrigin(parsed.originModel, parsed.originContent);
@@ -81,15 +184,72 @@ async function consumeSSE(response: Response) {
           continue;
         }
 
+        if (parsed.type === 'observer_status' && parsed.model && parsed.status) {
+          store.setObserverStatus(parsed.model, parsed.status);
+          continue;
+        }
+
+        if (parsed.type === 'observer_snapshot' && parsed.snapshot) {
+          store.upsertObserverSnapshot(parsed.snapshot as ObserverSnapshot);
+          continue;
+        }
+
+        if (parsed.type === 'stream_debug' && parsed.model) {
+          store.setResponseDebug(parsed.model, {
+            chunkCount: parsed.chunkCount,
+            contentChars: parsed.contentChars,
+            thinkingChars: parsed.thinkingChars,
+            stopReason: parsed.stopReason,
+            providerError: parsed.error,
+            lastEvent: parsed.phase,
+            note: parsed.note,
+          }, parsed.target ?? store.activeStreamTarget ?? 'parallel');
+          continue;
+        }
+
+        if (parsed.type === 'stream_timeout' && parsed.model) {
+          store.markStalled(parsed.model, {
+            target: store.activeStreamTarget ?? 'parallel',
+            retryable: true,
+            partialRetained: true,
+            error: parsed.reason === 'idle_timeout' ? 'Streaming stalled' : 'Request timed out',
+          });
+          continue;
+        }
+
         if (parsed.error && !parsed.model) {
           console.error('[consumeSSE] Global error:', parsed.error);
+          const targetResponses =
+            store.activeStreamTarget === 'observer'
+              ? store.observerResponses
+              : store.activeStreamTarget === 'compare'
+              ? store.compareResponses
+              : store.activeStreamTarget === 'synthesize'
+                ? store.synthesizeResponses
+                : store.activeStreamTarget === 'handoff'
+                  ? store.handoffResponses
+                  : store.parallelResponses;
+          for (const key of Object.keys(targetResponses)) {
+            if (!targetResponses[key].done) {
+              store.markDone(key, parsed.error);
+            }
+          }
+          clearActiveStreamWatch();
           store.finishStreaming();
           return;
         }
 
         if (parsed.done) {
           console.log(`[consumeSSE] ${parsed.model} done (error=${parsed.error ?? 'none'})`);
-          store.markDone(parsed.model, parsed.error);
+          store.markDone(parsed.model, parsed.error, {
+            stopReason: parsed.stopReason,
+            promptTokens: parsed.usage?.promptTokens,
+            completionTokens: parsed.usage?.completionTokens,
+            reasoningTokens: parsed.usage?.reasoningTokens,
+            cachedTokens: parsed.usage?.cachedTokens,
+            estimatedCostUsd: parsed.estimatedCostUsd,
+            pricingSource: parsed.pricingSource,
+          });
         } else if (parsed.thinkingContent) {
           // Thinking / chain-of-thought content — streamed separately
           store.appendThinkingChunk(parsed.model, parsed.thinkingContent);
@@ -103,6 +263,7 @@ async function consumeSSE(response: Response) {
   }
 
   console.log('[consumeSSE] Reader loop ended, calling finishStreaming');
+  clearActiveStreamWatch();
   store.finishStreaming();
 }
 
@@ -116,6 +277,7 @@ export async function streamPrompt(prompt: string) {
   if (selectedModels.length === 0) return;
 
   store.startStreaming();
+  store.setLastParallelPrompt(prompt);
 
   // Only include thinking config for models that have it enabled
   const activeThinking: Record<string, any> = {};
@@ -127,9 +289,12 @@ export async function streamPrompt(prompt: string) {
   }
 
   try {
+    const controller = new AbortController();
+    startActiveStreamWatch('parallel', selectedModels, controller);
     const response = await fetch(`${API_BASE}/api/prompt/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify({
         prompt,
         models: selectedModels,
@@ -141,11 +306,127 @@ export async function streamPrompt(prompt: string) {
     await consumeSSE(response);
   } catch (err: any) {
     console.error('[streamPrompt] fetch error:', err);
+    clearActiveStreamWatch();
     // Mark all models as errored so UI doesn't stay stuck
     for (const model of selectedModels) {
-      store.markDone(model, `Connection failed: ${err.message ?? 'Network error'}`);
+      if (err?.name === 'AbortError') {
+        store.markStalled(model, { target: 'parallel', retryable: true, partialRetained: true, error: 'Streaming stalled' });
+      } else {
+        store.markDone(model, `Connection failed: ${err.message ?? 'Network error'}`);
+      }
     }
     store.finishStreaming();
+  }
+}
+
+export async function streamObserver(prompt: string) {
+  const store = useChatStore.getState();
+  const { sessionId, observerActiveModel, observerModels, thinkingConfig } = store;
+
+  if (!observerActiveModel) return;
+
+  const activeThinking: Record<string, any> = {};
+  for (const model of [observerActiveModel, ...observerModels]) {
+    const tc = thinkingConfig[model];
+    if (tc?.enabled) {
+      activeThinking[model] = tc;
+    }
+  }
+
+  store.startStreamingFor([observerActiveModel], 'observer');
+  store.setLastObserverPrompt(prompt);
+  observerModels.forEach((model) => store.setObserverStatus(model, 'syncing'));
+
+  try {
+    const controller = new AbortController();
+    startActiveStreamWatch('observer', [observerActiveModel], controller);
+    const response = await fetch(`${API_BASE}/api/observer/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        prompt,
+        sessionId,
+        activeModel: observerActiveModel,
+        observerModels,
+        ...(Object.keys(activeThinking).length > 0 && { thinking: activeThinking }),
+      }),
+    });
+
+    await consumeSSE(response);
+  } catch (err: any) {
+    clearActiveStreamWatch();
+    if (err?.name === 'AbortError') {
+      store.markStalled(observerActiveModel, { target: 'observer', retryable: true, partialRetained: true, error: 'Streaming stalled' });
+    } else {
+      store.markDone(observerActiveModel, `Connection failed: ${err.message ?? 'Network error'}`);
+    }
+    observerModels.forEach((model) => store.setObserverStatus(model, 'error'));
+    store.finishStreaming();
+  }
+}
+
+export async function fetchUrlPreviews(prompt: string): Promise<UrlPreview[]> {
+  try {
+    const response = await fetch(`${API_BASE}/api/prompt/url-preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt }),
+    });
+    if (!response.ok) return [];
+    const data = await response.json();
+    return data.previews ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchWebContextPreview(url: string): Promise<WebPagePreviewResponse | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/web-context/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function attachWebPages(sessionId: string, rootUrl: string, selectedUrls: string[]): Promise<WebPageRef[]> {
+  try {
+    const response = await fetch(`${API_BASE}/api/web-context/attach`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, rootUrl, selectedUrls }),
+    });
+    if (!response.ok) return [];
+    const data = await response.json();
+    return data.pages ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchWebContext(sessionId: string): Promise<WebPageRef[]> {
+  try {
+    const response = await fetch(`${API_BASE}/api/web-context/session/${sessionId}`);
+    if (!response.ok) return [];
+    const data = await response.json();
+    return data.pages ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function deleteWebPageAttachment(id: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/api/web-context/${id}`, { method: 'DELETE' });
+    return response.ok;
+  } catch {
+    return false;
   }
 }
 
@@ -159,19 +440,33 @@ export async function streamHandoff(instruction?: string) {
   if (!sessionId || !handoffFromModel || !handoffToModel) return;
 
   store.startHandoffStreaming(handoffToModel);
+  store.setLastHandoffInstruction(instruction ?? null);
 
-  const response = await fetch(`${API_BASE}/api/handoff/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sessionId,
-      fromModel: handoffFromModel,
-      toModel: handoffToModel,
-      instruction: instruction || undefined,
-    }),
-  });
+  try {
+    const controller = new AbortController();
+    startActiveStreamWatch('handoff', [handoffToModel], controller);
+    const response = await fetch(`${API_BASE}/api/handoff/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        sessionId,
+        fromModel: handoffFromModel,
+        toModel: handoffToModel,
+        instruction: instruction || undefined,
+      }),
+    });
 
-  await consumeSSE(response);
+    await consumeSSE(response);
+  } catch (err: any) {
+    clearActiveStreamWatch();
+    if (err?.name === 'AbortError') {
+      store.markStalled(handoffToModel, { target: 'handoff', retryable: true, partialRetained: true, error: 'Streaming stalled' });
+    } else {
+      store.markDone(handoffToModel, `Connection failed: ${err.message ?? 'Network error'}`);
+    }
+    store.finishStreaming();
+  }
 }
 
 /**
@@ -187,20 +482,36 @@ export async function streamCompare(
 
   if (!sessionId || criticModels.length === 0) return;
 
-  store.startStreamingFor(criticModels);
+  store.startStreamingFor(criticModels, 'compare');
+  store.setLastCompareRequest({ originModel, criticModels, instruction: instruction || undefined });
 
-  const response = await fetch(`${API_BASE}/api/compare/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sessionId,
-      originModel,
-      criticModels,
-      instruction: instruction || undefined,
-    }),
-  });
+  try {
+    const controller = new AbortController();
+    startActiveStreamWatch('compare', criticModels, controller);
+    const response = await fetch(`${API_BASE}/api/compare/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        sessionId,
+        originModel,
+        criticModels,
+        instruction: instruction || undefined,
+      }),
+    });
 
-  await consumeSSE(response);
+    await consumeSSE(response);
+  } catch (err: any) {
+    clearActiveStreamWatch();
+    for (const model of criticModels) {
+      if (err?.name === 'AbortError') {
+        store.markStalled(model, { target: 'compare', retryable: true, partialRetained: true, error: 'Streaming stalled' });
+      } else {
+        store.markDone(model, `Connection failed: ${err.message ?? 'Network error'}`);
+      }
+    }
+    store.finishStreaming();
+  }
 }
 
 /**
@@ -216,20 +527,215 @@ export async function streamSynthesize(
 
   if (!sessionId || sourceModels.length < 2) return;
 
-  store.startStreamingFor([synthesizerModel]);
+  store.startStreamingFor([synthesizerModel], 'synthesize');
+  store.setLastSynthesizeRequest({ sourceModels, synthesizerModel, instruction: instruction || undefined });
 
-  const response = await fetch(`${API_BASE}/api/synthesize/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      sessionId,
-      sourceModels,
-      synthesizerModel,
-      instruction: instruction || undefined,
-    }),
-  });
+  try {
+    const controller = new AbortController();
+    startActiveStreamWatch('synthesize', [synthesizerModel], controller);
+    const response = await fetch(`${API_BASE}/api/synthesize/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        sessionId,
+        sourceModels,
+        synthesizerModel,
+        instruction: instruction || undefined,
+      }),
+    });
 
-  await consumeSSE(response);
+    await consumeSSE(response);
+  } catch (err: any) {
+    clearActiveStreamWatch();
+    if (err?.name === 'AbortError') {
+      store.markStalled(synthesizerModel, { target: 'synthesize', retryable: true, partialRetained: true, error: 'Streaming stalled' });
+    } else {
+      store.markDone(synthesizerModel, `Connection failed: ${err.message ?? 'Network error'}`);
+    }
+    store.finishStreaming();
+  }
+}
+
+export async function retryModelResponse(
+  target: 'observer' | 'parallel' | 'compare' | 'synthesize' | 'handoff',
+  model: string,
+  options?: {
+    continuationFrom?: string;
+    richOutput?: boolean;
+    auto?: boolean;
+  },
+) {
+  const store = useChatStore.getState();
+  const { sessionId, thinkingConfig } = store;
+  if (!sessionId) return false;
+
+  if (target === 'parallel') {
+    const activeThinking: Record<string, any> = {};
+    const tc = thinkingConfig[model];
+    if (tc?.enabled) activeThinking[model] = tc;
+    store.startStreamingFor([model], 'parallel');
+    try {
+      const controller = new AbortController();
+      startActiveStreamWatch('parallel', [model], controller);
+      const response = await fetch(`${API_BASE}/api/prompt/retry-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          sessionId,
+          models: [model],
+          ...(options?.continuationFrom ? { continuationFrom: options.continuationFrom, richOutput: options.richOutput, autoRetry: options.auto } : {}),
+          ...(Object.keys(activeThinking).length > 0 && { thinking: activeThinking }),
+        }),
+      });
+      await consumeSSE(response);
+      return true;
+    } catch (err: any) {
+      clearActiveStreamWatch();
+      if (err?.name === 'AbortError') {
+        store.markStalled(model, { target: 'parallel', retryable: true, partialRetained: true, error: 'Streaming stalled' });
+      } else {
+        store.markDone(model, `Connection failed: ${err.message ?? 'Network error'}`);
+      }
+      store.finishStreaming();
+      return false;
+    }
+  }
+
+  if (target === 'observer') {
+    const activeThinking: Record<string, any> = {};
+    const tc = thinkingConfig[model];
+    if (tc?.enabled) activeThinking[model] = tc;
+    store.startStreamingFor([model], 'observer');
+    try {
+      const controller = new AbortController();
+      startActiveStreamWatch('observer', [model], controller);
+      const response = await fetch(`${API_BASE}/api/observer/retry-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          sessionId,
+          activeModel: model,
+          observerModels: store.observerModels,
+          ...(options?.continuationFrom ? { continuationFrom: options.continuationFrom, richOutput: options.richOutput, autoRetry: options.auto } : {}),
+          ...(Object.keys(activeThinking).length > 0 && { thinking: activeThinking }),
+        }),
+      });
+      await consumeSSE(response);
+      return true;
+    } catch (err: any) {
+      clearActiveStreamWatch();
+      if (err?.name === 'AbortError') {
+        store.markStalled(model, { target: 'observer', retryable: true, partialRetained: true, error: 'Streaming stalled' });
+      } else {
+        store.markDone(model, `Connection failed: ${err.message ?? 'Network error'}`);
+      }
+      store.finishStreaming();
+      return false;
+    }
+  }
+
+  if (target === 'handoff') {
+    if (!store.handoffFromModel || !store.handoffToModel) return false;
+    store.startHandoffStreaming(store.handoffToModel);
+    try {
+      const controller = new AbortController();
+      startActiveStreamWatch('handoff', [store.handoffToModel], controller);
+      const response = await fetch(`${API_BASE}/api/handoff/retry-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          sessionId,
+          fromModel: store.handoffFromModel,
+          toModel: store.handoffToModel,
+          instruction: store.lastHandoffInstruction || undefined,
+          ...(options?.continuationFrom ? { continuationFrom: options.continuationFrom, richOutput: options.richOutput, autoRetry: options.auto } : {}),
+        }),
+      });
+      await consumeSSE(response);
+      return true;
+    } catch (err: any) {
+      clearActiveStreamWatch();
+      if (err?.name === 'AbortError') {
+        store.markStalled(store.handoffToModel, { target: 'handoff', retryable: true, partialRetained: true, error: 'Streaming stalled' });
+      } else {
+        store.markDone(store.handoffToModel, `Connection failed: ${err.message ?? 'Network error'}`);
+      }
+      store.finishStreaming();
+      return false;
+    }
+  }
+
+  if (target === 'compare') {
+    const req = store.lastCompareRequest;
+    if (!req) return false;
+    try {
+      store.startStreamingFor([model], 'compare');
+      const controller = new AbortController();
+      startActiveStreamWatch('compare', [model], controller);
+      const response = await fetch(`${API_BASE}/api/compare/retry-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          sessionId,
+          originModel: req.originModel,
+          criticModels: [model],
+          instruction: req.instruction,
+          ...(options?.continuationFrom ? { continuationFrom: options.continuationFrom, richOutput: options.richOutput, autoRetry: options.auto } : {}),
+        }),
+      });
+      await consumeSSE(response);
+      return true;
+    } catch (err: any) {
+      clearActiveStreamWatch();
+      if (err?.name === 'AbortError') {
+        store.markStalled(model, { target: 'compare', retryable: true, partialRetained: true, error: 'Streaming stalled' });
+      } else {
+        store.markDone(model, `Connection failed: ${err.message ?? 'Network error'}`);
+      }
+      store.finishStreaming();
+      return false;
+    }
+  }
+
+  if (target === 'synthesize') {
+    const req = store.lastSynthesizeRequest;
+    if (!req || req.synthesizerModel !== model) return false;
+    try {
+      store.startStreamingFor([model], 'synthesize');
+      const controller = new AbortController();
+      startActiveStreamWatch('synthesize', [model], controller);
+      const response = await fetch(`${API_BASE}/api/synthesize/retry-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          sessionId,
+          sourceModels: req.sourceModels,
+          synthesizerModel: req.synthesizerModel,
+          instruction: req.instruction,
+          ...(options?.continuationFrom ? { continuationFrom: options.continuationFrom, richOutput: options.richOutput, autoRetry: options.auto } : {}),
+        }),
+      });
+      await consumeSSE(response);
+      return true;
+    } catch (err: any) {
+      clearActiveStreamWatch();
+      if (err?.name === 'AbortError') {
+        store.markStalled(model, { target: 'synthesize', retryable: true, partialRetained: true, error: 'Streaming stalled' });
+      } else {
+        store.markDone(model, `Connection failed: ${err.message ?? 'Network error'}`);
+      }
+      store.finishStreaming();
+      return false;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -242,6 +748,14 @@ export async function fetchTimeline(sessionId: string) {
     const data = await response.json();
     const store = useChatStore.getState();
     store.setTimeline(data.entries as TimelineEntry[]);
+    const session = await fetchSessionApi(sessionId);
+    store.setCurrentSession(session);
+    if (session?.sessionType === 'topic') {
+      store.setTopicActions(await fetchTopicActions(sessionId));
+    } else {
+      store.setTopicActions([]);
+    }
+    store.setAttachedWebPages(await fetchWebContext(sessionId));
   } catch {
     // Silently fail — timeline is supplementary
   }
@@ -261,35 +775,176 @@ export async function restoreSession(sessionId: string): Promise<boolean> {
     const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/messages`);
     if (!response.ok) return false;
     const data = await response.json();
-    const messages: { role: string; content: string; sourceModel: string; mode?: string }[] = data.messages ?? [];
+    const messages: { id: string; role: string; content: string; sourceModel: string; mode?: string; handoffFrom?: string | null }[] = data.messages ?? [];
 
     if (messages.length === 0) return false;
 
     const store = useChatStore.getState();
     store.setSessionId(sessionId);
+    const session = await fetchSessionApi(sessionId);
+    store.setCurrentSession(session);
+    if (session?.interactionMode === 'observer') {
+      const observerSelection = [
+        session.activeModel,
+        ...(session.observerModels ?? []),
+      ].filter((model): model is string => Boolean(model));
+      if (observerSelection.length > 0) {
+        store.setSelectedModels(observerSelection);
+      }
+      store.setObserverConfig(session.activeModel ?? null, session.observerModels ?? []);
+      const observerState = await fetchObserverState(sessionId);
+      store.setObserverSnapshots(observerState?.snapshots ?? []);
+    } else {
+      store.setObserverConfig(null, []);
+      store.setObserverSnapshots([]);
+    }
+    if (session?.sessionType === 'topic') {
+      store.setTopicActions(await fetchTopicActions(sessionId));
+    } else {
+      store.setTopicActions([]);
+    }
+    store.setAttachedWebPages(await fetchWebContext(sessionId));
 
-    // Rebuild responses from the latest assistant messages per model
-    const latestByModel: Record<string, string> = {};
+    // Rebuild responses from the latest assistant messages per provider lane
+    const latestByProvider: Record<string, { model: string; content: string; order: number; mode?: string | null; messageId?: string }> = {};
+    const latestCompareByModel: Record<string, import('@/stores/chat-store').ModelResponse> = {};
+    const latestHandoffByModel: Record<string, import('@/stores/chat-store').ModelResponse> = {};
+    const latestSynthesizeByModel: Record<string, import('@/stores/chat-store').ModelResponse> = {};
     let lastSynthesizerModel: string | null = null;
+    let lastHandoffFromModel: string | null = null;
+    let lastHandoffToModel: string | null = null;
+    let latestCompareOriginModel: string | null = null;
+    let latestCompareOriginContent: string | null = null;
 
-    for (const msg of messages) {
+    messages.forEach((msg, index) => {
       if (msg.role === 'assistant') {
-        latestByModel[msg.sourceModel] = msg.content;
+        const provider = MODELS[msg.sourceModel]?.provider ?? msg.sourceModel;
+        const current = latestByProvider[provider];
+        if (!current || index >= current.order) {
+          latestByProvider[provider] = {
+            model: msg.sourceModel,
+            content: msg.content,
+            order: index,
+            mode: msg.mode ?? null,
+            messageId: msg.id,
+          };
+        }
+
+        if (msg.mode === 'compare') {
+          latestCompareByModel[msg.sourceModel] = {
+            model: msg.sourceModel,
+            content: msg.content,
+            done: true,
+            mode: 'compare',
+            messageId: msg.id,
+            streamStatus: 'completed',
+            retryable: false,
+            partialRetained: false,
+            attempt: 1,
+          };
+        }
+
+        if (msg.mode === 'handoff') {
+          latestHandoffByModel[msg.sourceModel] = {
+            model: msg.sourceModel,
+            content: msg.content,
+            done: true,
+            mode: 'handoff',
+            messageId: msg.id,
+            streamStatus: 'completed',
+            retryable: false,
+            partialRetained: false,
+            attempt: 1,
+          };
+          lastHandoffToModel = msg.sourceModel;
+          lastHandoffFromModel = msg.handoffFrom ?? lastHandoffFromModel;
+        }
+
+        if (msg.mode === 'synthesize') {
+          latestSynthesizeByModel[msg.sourceModel] = {
+            model: msg.sourceModel,
+            content: msg.content,
+            done: true,
+            mode: 'synthesize',
+            messageId: msg.id,
+            streamStatus: 'completed',
+            retryable: false,
+            partialRetained: false,
+            attempt: 1,
+          };
+        }
 
         // Track the most recent synthesize result so we can restore it
         if (msg.mode === 'synthesize') {
           lastSynthesizerModel = msg.sourceModel;
         }
       }
+    });
+
+    const compareMessages = messages
+      .map((msg, index) => ({ ...msg, order: index }))
+      .filter((msg) => msg.role === 'assistant' && msg.mode === 'compare');
+    if (compareMessages.length > 0) {
+      const firstCompareOrder = compareMessages[0].order;
+      const origin = [...messages]
+        .slice(0, firstCompareOrder)
+        .reverse()
+        .find((msg) => msg.role === 'assistant' && msg.mode !== 'compare');
+      if (origin) {
+        latestCompareOriginModel = origin.sourceModel;
+        latestCompareOriginContent = origin.content;
+      }
     }
 
     const responses: Record<string, import('@/stores/chat-store').ModelResponse> = {};
-    for (const [model, content] of Object.entries(latestByModel)) {
-      responses[model] = { model, content, done: true };
+    for (const { model, content, mode, messageId } of Object.values(latestByProvider)) {
+      responses[model] = {
+        model,
+        content,
+        done: true,
+        mode: mode ?? null,
+        messageId,
+        streamStatus: 'completed',
+        retryable: false,
+        partialRetained: false,
+        attempt: 1,
+      };
     }
     store.clearResponses();
+    let observerResponses: Record<string, import('@/stores/chat-store').ModelResponse> = {};
+    if (session?.interactionMode === 'observer' && session.activeModel) {
+      const latestActiveObserver = [...messages]
+        .reverse()
+        .find((msg) => msg.role === 'assistant' && msg.sourceModel === session.activeModel && msg.mode === 'observer');
+      if (latestActiveObserver) {
+        observerResponses = {
+          [session.activeModel]: {
+            model: session.activeModel,
+            content: latestActiveObserver.content,
+            done: true,
+            mode: latestActiveObserver.mode ?? 'observer',
+            messageId: latestActiveObserver.id,
+            streamStatus: 'completed',
+            retryable: false,
+            partialRetained: false,
+            attempt: 1,
+          },
+        };
+      }
+    }
     // Set responses directly via Zustand set
-    useChatStore.setState({ responses });
+    useChatStore.setState({
+      observerResponses,
+      parallelResponses: responses,
+      compareResponses: latestCompareByModel,
+      synthesizeResponses: latestSynthesizeByModel,
+      handoffResponses: latestHandoffByModel,
+      activeStreamTarget: null,
+      compareOriginModel: latestCompareOriginModel,
+      compareOriginContent: latestCompareOriginContent,
+      handoffFromModel: lastHandoffFromModel,
+      handoffToModel: lastHandoffToModel,
+    });
 
     // Restore synthesizer model if session had a synthesize result
     if (lastSynthesizerModel) {
@@ -300,6 +955,47 @@ export async function restoreSession(sessionId: string): Promise<boolean> {
     await fetchTimeline(sessionId);
 
     return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchPreviewArtifact(sessionId: string, messageId: string): Promise<RichPreviewArtifact | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/messages/${messageId}/preview-artifact`);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.artifact ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function savePreviewArtifact(
+  sessionId: string,
+  messageId: string,
+  payload: ManualPreviewRequest,
+): Promise<RichPreviewArtifact | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/messages/${messageId}/preview-artifact`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.artifact ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function deletePreviewArtifact(sessionId: string, messageId: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/messages/${messageId}/preview-artifact`, {
+      method: 'DELETE',
+    });
+    return response.ok;
   } catch {
     return false;
   }
@@ -509,8 +1205,13 @@ export async function fetchSessions(): Promise<Session[]> {
 /**
  * Delete a session.
  */
-export async function deleteSessionApi(id: string): Promise<void> {
-  await fetch(`${API_BASE}/api/sessions/${id}`, { method: 'DELETE' });
+export async function deleteSessionApi(id: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${id}`, { method: 'DELETE' });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -565,6 +1266,155 @@ export async function switchToSession(id: string): Promise<void> {
   await restoreSession(id);
   const links = await fetchSessionLinks(id);
   useChatStore.getState().setLinkedSessions(links);
+}
+
+export async function fetchSessionApi(id: string): Promise<Session | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${id}`);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.session ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchObserverState(sessionId: string): Promise<{ config: ObserverConfig | null; snapshots: ObserverSnapshot[] } | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/observer/${sessionId}`);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return {
+      config: data.config ?? null,
+      snapshots: data.snapshots ?? [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function updateObserverConfigApi(
+  sessionId: string,
+  payload: { activeModel: string; observerModels: string[] }
+): Promise<Session | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/observer-config`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        interactionMode: 'observer',
+        activeModel: payload.activeModel,
+        observerModels: payload.observerModels,
+      }),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.session ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function runObserverAction(
+  sessionId: string,
+  action: ObserverActionType,
+  model: string,
+  instruction?: string,
+): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/api/observer/${sessionId}/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, instruction }),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchTopicActions(sessionId: string): Promise<Session[]> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/actions`);
+    if (!response.ok) return [];
+    const data = await response.json();
+    return data.actions ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function createActionSession(sessionId: string, payload: CreateActionRequest): Promise<Session | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/actions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.session ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function updateActionSessionApi(
+  sessionId: string,
+  update: { actionStatus?: ActionStatus; actionTitle?: string; actionTarget?: string; resultSummary?: string }
+): Promise<Session | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/action`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(update),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.session ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function writeBackActionResult(sessionId: string, summary: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/action/writeback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ summary }),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function bootstrapSessionFromKB(
+  payload: KBSessionBootstrapRequest
+): Promise<KBSessionBootstrapResponse | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/bootstrap-from-kb`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchSessionBootstrap(sessionId: string): Promise<SessionBootstrapRecord | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/sessions/${sessionId}/bootstrap`);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.bootstrap ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // --- Decision Memory APIs ---
@@ -1221,11 +2071,15 @@ export async function updateTriageSettings(
 
 export async function uploadImportFile(
   file: File,
-  platform: 'chatgpt' | 'claude' | 'gemini'
-): Promise<any> {
+  platform: 'chatgpt' | 'claude' | 'gemini',
+  projectName?: string
+): Promise<ImportProgress> {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('platform', platform);
+  if (projectName?.trim()) {
+    formData.append('projectName', projectName.trim());
+  }
 
   const res = await fetch(`${API_BASE}/api/import/upload`, {
     method: 'POST',
@@ -1233,6 +2087,103 @@ export async function uploadImportFile(
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
+}
+
+export async function syncChatGPTConversations(
+  conversations: ChatGPTSyncConversation[],
+  projectName?: string
+): Promise<ImportProgress> {
+  const res = await fetch(`${API_BASE}/api/import/chatgpt-sync`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      projectName: projectName?.trim() || undefined,
+      conversations,
+    }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchImportProjects(): Promise<ImportProjectTarget[]> {
+  const res = await fetch(`${API_BASE}/api/import/projects`);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.projects ?? [];
+}
+
+export async function fetchChatGPTSyncRuns(limit: number = 10): Promise<ImportSyncRun[]> {
+  const res = await fetch(`${API_BASE}/api/import/chatgpt-sync/history?limit=${limit}`);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.runs ?? [];
+}
+
+export async function fetchLatestChatGPTSyncRun(): Promise<ImportSyncRun | null> {
+  const res = await fetch(`${API_BASE}/api/import/chatgpt-sync/latest`);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.run ?? null;
+}
+
+export async function syncClaudeConversations(
+  conversations: ClaudeSyncConversation[],
+  projectName?: string
+): Promise<ImportProgress> {
+  const res = await fetch(`${API_BASE}/api/import/claude-sync`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      projectName: projectName?.trim() || undefined,
+      conversations,
+    }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchClaudeSyncRuns(limit: number = 10): Promise<ImportSyncRun[]> {
+  const res = await fetch(`${API_BASE}/api/import/claude-sync/history?limit=${limit}`);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.runs ?? [];
+}
+
+export async function fetchLatestClaudeSyncRun(): Promise<ImportSyncRun | null> {
+  const res = await fetch(`${API_BASE}/api/import/claude-sync/latest`);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.run ?? null;
+}
+
+export async function syncGeminiConversations(
+  conversations: GeminiSyncConversation[],
+  projectName?: string
+): Promise<ImportProgress> {
+  const res = await fetch(`${API_BASE}/api/import/gemini-sync`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      projectName: projectName?.trim() || undefined,
+      conversations,
+    }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchGeminiSyncRuns(limit: number = 10): Promise<ImportSyncRun[]> {
+  const res = await fetch(`${API_BASE}/api/import/gemini-sync/history?limit=${limit}`);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.runs ?? [];
+}
+
+export async function fetchLatestGeminiSyncRun(): Promise<ImportSyncRun | null> {
+  const res = await fetch(`${API_BASE}/api/import/gemini-sync/latest`);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  return data.run ?? null;
 }
 
 export async function fetchImportedConversations(opts?: {
@@ -1258,6 +2209,294 @@ export async function fetchImportedMessages(conversationId: string): Promise<any
   return res.json();
 }
 
+export async function updateImportedConversationTitle(conversationId: string, title: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/import/conversations/${conversationId}/title`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+export async function regenerateImportedConversationTitle(conversationId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/import/conversations/${conversationId}/regenerate-title`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+export async function deleteImportedConversation(conversationId: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`${API_BASE}/api/import/conversations/${conversationId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function getObsidianSettings(): Promise<{ vaultPath: string | null }> {
+  const res = await fetch(`${API_BASE}/api/obsidian/settings`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function saveObsidianSettings(vaultPath: string): Promise<{ ok: boolean; vaultPath: string }> {
+  const res = await fetch(`${API_BASE}/api/obsidian/settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ vaultPath }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function pickObsidianVaultFolder(): Promise<{ ok: boolean; vaultPath: string }> {
+  const res = await fetch(`${API_BASE}/api/obsidian/pick-folder`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function exportImportedRawSourceToObsidian(conversationId: string, vaultPath?: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/obsidian/export/raw-source`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversationId, vaultPath }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function createKnowledgeNoteFromImportedConversation(
+  conversationId: string,
+  model?: string,
+  destinationType?: 'obsidian_context' | 'obsidian_observation' | 'obsidian_evergreen'
+): Promise<{ ok: boolean; title: string; content: string; model: string; destinationType: string; knowledgeMaturity: string; compilerRun?: any }> {
+  const res = await fetch(`${API_BASE}/api/import/conversations/${conversationId}/create-knowledge-note`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, destinationType }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function exportKnowledgeNoteToObsidian(
+  conversationId: string,
+  content: string,
+  title?: string,
+  vaultPath?: string,
+  destinationType?: 'obsidian_context' | 'obsidian_observation' | 'obsidian_evergreen',
+  knowledgeMaturity?: 'context' | 'incubating' | 'evergreen',
+  compilerRunId?: string | null
+): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/export-note`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ conversationId, content, title, vaultPath, destinationType, knowledgeMaturity, compilerRunId }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function compileSourceToWiki(input: {
+  sourceKind?: 'imported' | 'native';
+  sourceId?: string;
+  conversationId?: string;
+  sessionId?: string;
+  vaultPath?: string;
+  model?: string;
+}): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/compile-source`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchWikiBackfillPlan(params?: {
+  platform?: string;
+  search?: string;
+  limit?: number;
+}): Promise<any> {
+  const query = new URLSearchParams();
+  if (params?.platform) query.set('platform', params.platform);
+  if (params?.search) query.set('search', params.search);
+  if (typeof params?.limit === 'number') query.set('limit', String(params.limit));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  const res = await fetch(`${API_BASE}/api/wiki/backfill-plan${suffix}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function applyWikiBackfillPlan(input: {
+  items: Array<{ conversationId: string; action: 'compile_now' | 'archive_only' | 'skip' }>;
+  vaultPath?: string;
+  model?: string;
+}): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/backfill-apply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function startWikiBackfillJob(input: {
+  vaultPath?: string;
+  model?: string;
+  platform?: string;
+  search?: string;
+  limit?: number;
+  batchSize?: number;
+  items?: Array<{ conversationId: string; action: 'compile_now' | 'archive_only' | 'skip' }>;
+}): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/backfill-jobs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchWikiBackfillJobs(limit: number = 10): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/backfill-jobs?limit=${limit}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchWikiBackfillJob(jobId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/backfill-jobs/${jobId}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function pauseWikiBackfillJob(jobId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/backfill-jobs/${jobId}/pause`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function resumeWikiBackfillJob(jobId: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/backfill-jobs/${jobId}/resume`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchWikiCompilePlans(params?: {
+  sourceId?: string;
+  sourceType?: string;
+  limit?: number;
+}): Promise<any> {
+  const query = new URLSearchParams();
+  if (params?.sourceId) query.set('sourceId', params.sourceId);
+  if (params?.sourceType) query.set('sourceType', params.sourceType);
+  if (typeof params?.limit === 'number') query.set('limit', String(params.limit));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  const res = await fetch(`${API_BASE}/api/wiki/compile-plans${suffix}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchWikiCompilePlan(id: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/compile-plans/${id}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function applyWikiCompilePlan(id: string, itemIds?: string[], vaultPath?: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/compile-plans/${id}/apply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ itemIds, vaultPath }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function rejectWikiCompilePlan(id: string, vaultPath?: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/compile-plans/${id}/reject`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ vaultPath }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function runWikiLint(vaultPath?: string, model?: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/lint/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ vaultPath, model }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchWikiLintRuns(limit?: number): Promise<any> {
+  const query = new URLSearchParams();
+  if (typeof limit === 'number') query.set('limit', String(limit));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  const res = await fetch(`${API_BASE}/api/wiki/lint/runs${suffix}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchWikiLintRun(id: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/lint/runs/${id}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function saveQueryArtifactToWiki(input: {
+  sessionId: string;
+  messageId?: string;
+  sourceModel?: string | null;
+  title?: string;
+  content: string;
+  artifactType: 'analysis' | 'comparison' | 'synthesis';
+  streamTarget?: 'prompt' | 'observer' | 'parallel' | 'compare' | 'synthesize';
+  promoteTo?: 'obsidian_observation' | 'obsidian_evergreen' | null;
+  vaultPath?: string;
+}): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/wiki/save-query-artifact`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function revealObsidianExport(filePath: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`${API_BASE}/api/obsidian/reveal`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filePath }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function createActionItemsFromImportedConversation(conversationId: string, model?: string): Promise<{ ok: boolean; title: string; content: string; model: string }> {
+  const res = await fetch(`${API_BASE}/api/import/conversations/${conversationId}/create-action-items`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
 export async function fetchImportStats(): Promise<any> {
   const res = await fetch(`${API_BASE}/api/import/stats`);
   if (!res.ok) throw new Error(await res.text());
@@ -1266,6 +2505,12 @@ export async function fetchImportStats(): Promise<any> {
 
 export async function deleteImportBatch(batchId: string): Promise<any> {
   const res = await fetch(`${API_BASE}/api/import/batch/${batchId}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function resetImportedData(): Promise<{ ok: boolean }> {
+  const res = await fetch(`${API_BASE}/api/import/reset-all`, { method: 'POST' });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -1415,6 +2660,42 @@ export async function deleteOutlineApi(
 
 export async function fetchConversationKnowledge(conversationId: string): Promise<any> {
   const res = await fetch(`${API_BASE}/api/knowledge/conversation/${conversationId}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function runCompiler(input: {
+  sourceKind: 'imported' | 'native';
+  sourceId: string;
+  destinationType?: 'obsidian_context' | 'obsidian_observation' | 'obsidian_evergreen';
+  model?: string;
+}): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/compiler/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchCompilerRuns(params?: {
+  sourceId?: string;
+  sourceType?: string;
+  limit?: number;
+}): Promise<any> {
+  const query = new URLSearchParams();
+  if (params?.sourceId) query.set('sourceId', params.sourceId);
+  if (params?.sourceType) query.set('sourceType', params.sourceType);
+  if (typeof params?.limit === 'number') query.set('limit', String(params.limit));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  const res = await fetch(`${API_BASE}/api/compiler/runs${suffix}`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchCompilerRun(id: string): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/compiler/runs/${id}`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -1729,11 +3010,30 @@ export async function fetchNotionWrites(sessionId?: string): Promise<any[]> {
 /**
  * Create a new session on the backend and return the session ID.
  */
+function buildDefaultObserverPayload() {
+  const store = useChatStore.getState();
+  const activeModel = store.selectedModels[0] ?? null;
+  const observerModels = store.selectedModels.slice(1, 3);
+  return {
+    interactionMode: 'observer' as const,
+    activeModel,
+    observerModels,
+  };
+}
+
 export async function createSession(): Promise<string | null> {
   try {
-    const res = await fetch(`${API_BASE}/api/sessions`, { method: 'POST' });
+    const res = await fetch(`${API_BASE}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildDefaultObserverPayload()),
+    });
     if (!res.ok) return null;
     const data = await res.json();
+    if (data.session) {
+      const store = useChatStore.getState();
+      store.setObserverConfig(data.session.activeModel ?? buildDefaultObserverPayload().activeModel, data.session.observerModels ?? buildDefaultObserverPayload().observerModels);
+    }
     return data.session?.id ?? data.id ?? null;
   } catch {
     return null;
@@ -1805,7 +3105,13 @@ export interface ModelEntry {
 
 export interface ModelsResponse {
   models: ModelEntry[];
-  registry: { staticCount: number; discoveredCount: number; lastRefreshedAt: number | null };
+  registry: {
+    staticCount: number;
+    discoveredCount: number;
+    lastRefreshedAt: number | null;
+    autoRefreshEnabled: boolean;
+    refreshIntervalMs: number;
+  };
 }
 
 export async function fetchModels(): Promise<ModelsResponse | null> {
@@ -1818,12 +3124,13 @@ export async function fetchModels(): Promise<ModelsResponse | null> {
   }
 }
 
-export async function refreshModels(): Promise<boolean> {
+export async function refreshModels(): Promise<(ModelsResponse & { success: boolean; added: number; total: number }) | null> {
   try {
     const res = await fetch(`${API_BASE}/api/models/refresh`, { method: 'POST' });
-    return res.ok;
+    if (!res.ok) return null;
+    return await res.json();
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -1904,4 +3211,303 @@ export async function ragIndexAll(): Promise<any> {
     console.error('[api] ragIndexAll failed:', err);
     return null;
   }
+}
+
+// ===== Structured Memory =====
+
+export async function fetchMemory(opts?: {
+  type?: MemoryType | 'all';
+  status?: 'active' | 'stale' | 'superseded' | 'archived' | 'all';
+  search?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<{ items: MemoryItem[]; total: number }> {
+  const params = new URLSearchParams();
+  if (opts?.type && opts.type !== 'all') params.set('type', opts.type);
+  if (opts?.status) params.set('status', opts.status);
+  if (opts?.search) params.set('search', opts.search);
+  if (opts?.limit) params.set('limit', String(opts.limit));
+  if (opts?.offset) params.set('offset', String(opts.offset));
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const res = await fetch(`${API_BASE}/api/memory${suffix}`);
+  if (!res.ok) return { items: [], total: 0 };
+  return res.json();
+}
+
+export async function fetchMemoryItem(id: string): Promise<MemoryItem | null> {
+  const res = await fetch(`${API_BASE}/api/memory/${id}`);
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export async function fetchMemoryReviewQueue(): Promise<MemoryCandidate[]> {
+  const res = await fetch(`${API_BASE}/api/memory/review-queue`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.candidates ?? [];
+}
+
+export async function fetchMemoryRelationshipCandidates(): Promise<MemoryCandidate[]> {
+  const res = await fetch(`${API_BASE}/api/memory/relationship-candidates`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.candidates ?? [];
+}
+
+export interface MemoryPromotionResult {
+  status: string;
+  added: number;
+  skippedDuplicates: number;
+  candidates: MemoryCandidate[];
+}
+
+export async function extractSessionMemory(sessionId: string): Promise<MemoryPromotionResult | null> {
+  const res = await fetch(`${API_BASE}/api/memory/extract/session/${sessionId}`, { method: 'POST' });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return {
+    status: data.status ?? 'ok',
+    added: data.extracted ?? data.added ?? 0,
+    skippedDuplicates: data.skippedDuplicates ?? 0,
+    candidates: data.candidates ?? [],
+  };
+}
+
+export async function promoteToMemory(payload: {
+  sessionId?: string;
+  messageId?: string;
+  typeHint?: MemoryType;
+  content?: string;
+  title?: string;
+  summary?: string;
+}): Promise<MemoryPromotionResult | null> {
+  const res = await fetch(`${API_BASE}/api/memory/promote`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return {
+    status: data.status ?? 'ok',
+    added: data.added ?? (data.candidates?.length ?? 0),
+    skippedDuplicates: data.skippedDuplicates ?? 0,
+    candidates: data.candidates ?? [],
+  };
+}
+
+export async function confirmMemoryCandidateApi(id: string): Promise<MemoryItem | null> {
+  const res = await fetch(`${API_BASE}/api/memory/${id}/confirm`, { method: 'POST' });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export async function rejectMemoryCandidateApi(id: string): Promise<boolean> {
+  const res = await fetch(`${API_BASE}/api/memory/${id}/reject`, { method: 'POST' });
+  return res.ok;
+}
+
+export async function archiveMemoryItemApi(id: string): Promise<MemoryItem | null> {
+  const res = await fetch(`${API_BASE}/api/memory/${id}/archive`, { method: 'POST' });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export async function resetMemoryApi(): Promise<boolean> {
+  const res = await fetch(`${API_BASE}/api/memory/reset`, { method: 'POST' });
+  return res.ok;
+}
+
+export async function updateMemoryItemApi(id: string, update: Partial<MemoryItem>): Promise<MemoryItem | null> {
+  const res = await fetch(`${API_BASE}/api/memory/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export async function fetchMemoryGraph(): Promise<{ nodes: MemoryGraphNode[]; edges: MemoryGraphEdge[] }> {
+  const res = await fetch(`${API_BASE}/api/memory/graph`);
+  if (!res.ok) return { nodes: [], edges: [] };
+  return res.json();
+}
+
+export async function fetchMemoryTimeline(): Promise<MemoryTimelineEvent[]> {
+  const res = await fetch(`${API_BASE}/api/memory/timeline`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.events ?? [];
+}
+
+export async function fetchWorkingMemory(sessionId?: string | null): Promise<WorkingMemoryItem[]> {
+  const suffix = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : '';
+  const res = await fetch(`${API_BASE}/api/memory/working${suffix}`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.items ?? [];
+}
+
+export async function fetchMemoryExtractionRuns(): Promise<MemoryExtractionRun[]> {
+  const res = await fetch(`${API_BASE}/api/memory/extraction-runs`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.runs ?? [];
+}
+
+export async function fetchMemoryExtractionRunItems(id: string): Promise<MemoryExtractionRunItem[]> {
+  const res = await fetch(`${API_BASE}/api/memory/extraction-runs/${id}`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.items ?? [];
+}
+
+export async function fetchMemoryUsageRuns(): Promise<MemoryUsageRun[]> {
+  const res = await fetch(`${API_BASE}/api/memory/usage-runs`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.runs ?? [];
+}
+
+export async function fetchMemoryUsageRunItems(id: string): Promise<MemoryUsageRunItem[]> {
+  const res = await fetch(`${API_BASE}/api/memory/usage-runs/${id}`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.items ?? [];
+}
+
+export async function fetchMemoryContextPreview(opts: {
+  sessionId: string;
+  model?: string;
+  mode?: string | null;
+  prompt?: string;
+}): Promise<{ promptText: string | null; preview: MemoryInjectionPreview | null } | null> {
+  const params = new URLSearchParams({ sessionId: opts.sessionId });
+  if (opts.model) params.set('model', opts.model);
+  if (opts.mode) params.set('mode', opts.mode);
+  if (opts.prompt) params.set('prompt', opts.prompt);
+  const res = await fetch(`${API_BASE}/api/memory/context-preview?${params.toString()}`);
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export async function fetchTriggers(): Promise<{
+  candidates: TriggerCandidate[];
+  rules: TriggerRule[];
+  history: TriggerRun[];
+  notifications: TriggerNotification[];
+}> {
+  const res = await fetch(`${API_BASE}/api/triggers`);
+  if (!res.ok) return { candidates: [], rules: [], history: [], notifications: [] };
+  return res.json();
+}
+
+export async function fetchKnowledgeRelations(opts?: {
+  routingDecision?: 'graph_only' | 'memory_candidate' | 'trigger_candidate' | 'all';
+  limit?: number;
+}): Promise<RelationshipEvidence[]> {
+  const params = new URLSearchParams();
+  if (opts?.routingDecision && opts.routingDecision !== 'all') params.set('routingDecision', opts.routingDecision);
+  if (opts?.limit) params.set('limit', String(opts.limit));
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const res = await fetch(`${API_BASE}/api/knowledge/relations${suffix}`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.relations ?? [];
+}
+
+export async function fetchTriggerCandidates(): Promise<TriggerCandidate[]> {
+  const res = await fetch(`${API_BASE}/api/triggers/candidates`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.candidates ?? [];
+}
+
+export async function fetchTriggerHistory(): Promise<TriggerRun[]> {
+  const res = await fetch(`${API_BASE}/api/triggers/history`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.history ?? [];
+}
+
+export async function acceptTriggerCandidateApi(id: string): Promise<{ rule: TriggerRule; notification: TriggerNotification } | null> {
+  const res = await fetch(`${API_BASE}/api/triggers/${id}/accept`, { method: 'POST' });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export async function rejectTriggerCandidateApi(id: string): Promise<boolean> {
+  const res = await fetch(`${API_BASE}/api/triggers/${id}/reject`, { method: 'POST' });
+  return res.ok;
+}
+
+export async function snoozeTriggerCandidateApi(id: string, until?: number): Promise<TriggerCandidate | null> {
+  const res = await fetch(`${API_BASE}/api/triggers/${id}/snooze`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ until }),
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.candidate ?? null;
+}
+
+export async function scanTriggersApi(): Promise<TriggerCandidate[]> {
+  const res = await fetch(`${API_BASE}/api/triggers/scan`, { method: 'POST' });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.candidates ?? [];
+}
+
+export async function resetTriggersApi(): Promise<boolean> {
+  const res = await fetch(`${API_BASE}/api/triggers/reset`, { method: 'POST' });
+  return res.ok;
+}
+
+export async function sendTestNotificationApi(payload?: Record<string, unknown>): Promise<TriggerNotification | null> {
+  const res = await fetch(`${API_BASE}/api/notifications/test`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload ?? {}),
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.notification ?? null;
+}
+
+export async function fetchCostSummary(month?: string): Promise<{
+  month: string;
+  summary: LLMCostSummary;
+  providerRecords: ProviderCostRecord[];
+} | null> {
+  const params = new URLSearchParams();
+  if (month) params.set('month', month);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const res = await fetch(`${API_BASE}/api/costs/summary${suffix}`);
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export async function fetchSessionCost(sessionId: string): Promise<{
+  sessionId: string;
+  totalEstimatedUsd: number;
+  events: LLMUsageEvent[];
+  byProvider: Record<string, { estimatedUsd: number; totalTokens: number }>;
+  byModel: Record<string, { estimatedUsd: number; totalTokens: number }>;
+} | null> {
+  const res = await fetch(`${API_BASE}/api/costs/session/${sessionId}`);
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export async function syncProviderCosts(provider: 'openai' | 'anthropic', month?: string): Promise<{ ok: boolean; message?: string }> {
+  const res = await fetch(`${API_BASE}/api/costs/sync/${provider}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(month ? { month } : {}),
+  });
+  const data = await res.json().catch(() => ({ ok: false, message: `HTTP ${res.status}` }));
+  if (!res.ok) return { ok: false, message: data?.message ?? data?.error ?? `HTTP ${res.status}` };
+  return data;
 }

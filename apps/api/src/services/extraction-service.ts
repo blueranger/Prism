@@ -1,6 +1,9 @@
 import { v4 as uuid } from 'uuid';
 import { getDb } from '../memory/db';
 import { getAdapter } from '../adapters';
+import { getImportedConversation, getImportedMessages } from '../memory/import-store';
+import { getSession } from '../memory/session';
+import { getSessionMessages } from '../memory/conversation';
 import type { LLMProvider, EntityType, RelationType, ExtractionProgress } from '@prism/shared';
 
 const EXTRACTION_PROMPT = `You are a knowledge extraction assistant. Analyze the following conversation and extract:
@@ -221,6 +224,101 @@ export class ExtractionService {
         console.error(`[extraction] Native session ${session.id} failed:`, err.message);
       }
     }
+  }
+
+  async extractImportedConversationById(
+    conversationId: string,
+    provider: LLMProvider = 'openai',
+    model: string = 'gpt-4o-mini'
+  ): Promise<{ tags: number; entities: number; relations: number }> {
+    const db = getDb();
+    const existing = db.prepare('SELECT COUNT(*) as count FROM conversation_tags WHERE conversation_id = ?').get(conversationId) as { count: number };
+    if ((existing?.count ?? 0) > 0) {
+      return { tags: 0, entities: 0, relations: 0 };
+    }
+
+    const conversation = getImportedConversation(conversationId);
+    if (!conversation) throw new Error('Imported conversation not found');
+    const messages = getImportedMessages(conversationId);
+    if (messages.length === 0) return { tags: 0, entities: 0, relations: 0 };
+
+    const adapter = getAdapter(provider);
+    const extraction = await this.runExtraction(adapter, provider, model, conversation.title, messages.map((m) => ({ role: m.role, content: m.content })));
+    if (!extraction) return { tags: 0, entities: 0, relations: 0 };
+
+    this.storeExtractionResults(db, extraction, {
+      id: conversation.id,
+      title: conversation.title,
+      created_at: conversation.createdAt,
+    }, messages);
+
+    return {
+      tags: extraction.tags?.length ?? 0,
+      entities: extraction.entities?.length ?? 0,
+      relations: extraction.relations?.length ?? 0,
+    };
+  }
+
+  async extractNativeSessionById(
+    sessionId: string,
+    provider: LLMProvider = 'openai',
+    model: string = 'gpt-4o-mini'
+  ): Promise<{ tags: number; entities: number; relations: number }> {
+    const db = getDb();
+    const existing = db.prepare('SELECT COUNT(*) as count FROM session_tags WHERE session_id = ?').get(sessionId) as { count: number };
+    if ((existing?.count ?? 0) > 0) {
+      return { tags: 0, entities: 0, relations: 0 };
+    }
+
+    const session = getSession(sessionId);
+    if (!session) throw new Error('Session not found');
+    const messages = getSessionMessages(sessionId);
+    if (messages.length === 0) return { tags: 0, entities: 0, relations: 0 };
+
+    const adapter = getAdapter(provider);
+    const extraction = await this.runExtraction(adapter, provider, model, session.title || 'Untitled', messages.map((m) => ({ role: m.role, content: m.content })));
+    if (!extraction) return { tags: 0, entities: 0, relations: 0 };
+
+    this.storeNativeExtractionResults(db, extraction, {
+      id: session.id,
+      title: session.title || 'Untitled',
+    }, messages);
+
+    return {
+      tags: extraction.tags?.length ?? 0,
+      entities: extraction.entities?.length ?? 0,
+      relations: extraction.relations?.length ?? 0,
+    };
+  }
+
+  private async runExtraction(
+    adapter: any,
+    provider: LLMProvider,
+    model: string,
+    title: string,
+    messages: Array<{ role: string; content: string }>
+  ): Promise<ExtractionResult | null> {
+    const conversationText = messages
+      .map((m) => `[${m.role}]: ${m.content}`)
+      .join('\n\n');
+
+    const truncated = conversationText.split(/\s+/).slice(0, 3000).join(' ');
+    const prompt = EXTRACTION_PROMPT
+      .replace('{title}', title)
+      .replace('{content}', truncated);
+
+    let responseText = '';
+    const stream = adapter.stream({
+      model,
+      provider,
+      messages: [{ role: 'user' as const, content: prompt }],
+      temperature: 0.1,
+    });
+
+    for await (const chunk of stream) {
+      if (chunk.content) responseText += chunk.content;
+    }
+    return this.parseResponse(responseText, title);
   }
 
   /**

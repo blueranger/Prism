@@ -49,6 +49,15 @@ export class ClaudeParser implements ConversationParser {
         updatedAt: conv.updated_at,
         messageCount: convMessages.length,
         importBatchId: batchId,
+        metadata: {
+          model: conv.model ?? undefined,
+          currentLeafMessageUuid: conv.current_leaf_message_uuid ?? undefined,
+          projectUuid: conv.project_uuid ?? undefined,
+          projectName: conv.project_name ?? undefined,
+          accountUuid: conv.account_uuid ?? undefined,
+          accountEmailAddress: conv.account_email_address ?? undefined,
+          ...((conv.metadata && typeof conv.metadata === 'object') ? conv.metadata : {}),
+        },
       });
 
       messages.push(...convMessages);

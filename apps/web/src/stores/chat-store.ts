@@ -1,14 +1,37 @@
 import { create } from 'zustand';
 import { MAX_SELECTED_MODELS, MODELS, DEFAULT_MODELS } from '@prism/shared';
-import type { OperationMode, TimelineEntry, AgentTask, FlowGraph, FlowNode, Session, SessionLink, ExternalThread, ExternalMessage, DraftReply, MonitorRule, ConnectorStatus, CommNotification, ImportedConversation, ImportedMessage, ImportPlatform, ImportProgress, SearchResult, KnowledgeGraphData, KnowledgeEntity, Tag, ExtractionProgress, SessionOutline, ContextSource, KnowledgeHintMatch, ThinkingConfig } from '@prism/shared';
+import type { OperationMode, TimelineEntry, AgentTask, FlowGraph, FlowNode, ObserverSnapshot, ObserverStatus, Session, SessionLink, ExternalThread, ExternalMessage, DraftReply, MonitorRule, ConnectorStatus, CommNotification, ImportedConversation, ImportedMessage, ImportPlatform, ImportProgress, SearchResult, KnowledgeGraphData, KnowledgeEntity, Tag, ExtractionProgress, SessionOutline, ContextSource, KnowledgeHintMatch, ThinkingConfig, WebPageRef, ContextDebugInfo } from '@prism/shared';
 
 export interface ModelResponse {
   model: string;
   content: string;
   done: boolean;
   error?: string;
+  stopReason?: string;
+  mode?: string | null;
+  messageId?: string;
+  streamStatus?: 'streaming' | 'stalled' | 'completed' | 'error' | 'retrying';
+  lastChunkAt?: number;
+  partialRetained?: boolean;
+  retryable?: boolean;
+  attempt?: number;
   /** Accumulated thinking / chain-of-thought content */
   thinkingContent?: string;
+  promptTokens?: number;
+  completionTokens?: number;
+  reasoningTokens?: number;
+  cachedTokens?: number;
+  estimatedCostUsd?: number;
+  pricingSource?: 'static_registry_estimate' | 'provider_usage_estimate' | 'provider_reconciled';
+  debug?: {
+    chunkCount: number;
+    contentChars: number;
+    thinkingChars: number;
+    stopReason?: string;
+    providerError?: string;
+    lastEvent?: string;
+    note?: string;
+  };
 }
 
 /** Agent plan step for the dashboard */
@@ -25,10 +48,16 @@ export interface AgentPlanStep {
 interface ChatState {
   mode: OperationMode;
   selectedModels: string[];
-  responses: Record<string, ModelResponse>;
+  observerResponses: Record<string, ModelResponse>;
+  parallelResponses: Record<string, ModelResponse>;
+  compareResponses: Record<string, ModelResponse>;
+  synthesizeResponses: Record<string, ModelResponse>;
+  handoffResponses: Record<string, ModelResponse>;
+  activeStreamTarget: 'observer' | 'parallel' | 'compare' | 'synthesize' | 'handoff' | null;
   isStreaming: boolean;
   sessionId: string | null;
   timeline: TimelineEntry[];
+  lastContextDebug: Record<string, ContextDebugInfo> | null;
 
   // Handoff state
   handoffFromModel: string | null;
@@ -40,6 +69,18 @@ interface ChatState {
 
   // Synthesize state
   synthesizerModel: string | null;
+
+  // Observer state
+  observerActiveModel: string | null;
+  observerModels: string[];
+  observerSnapshots: Record<string, ObserverSnapshot>;
+  observerStatuses: Record<string, ObserverStatus>;
+  observerActionLoading: string | null;
+  lastParallelPrompt: string | null;
+  lastObserverPrompt: string | null;
+  lastHandoffInstruction: string | null;
+  lastCompareRequest: { originModel: string; criticModels: string[]; instruction?: string } | null;
+  lastSynthesizeRequest: { sourceModels: string[]; synthesizerModel: string; instruction?: string } | null;
 
   // Agent state
   agentTasks: AgentTask[];
@@ -55,6 +96,8 @@ interface ChatState {
 
   // Session management
   sessions: Session[];
+  currentSession: Session | null;
+  topicActions: Session[];
   sessionDrawerOpen: boolean;
   linkedSessions: SessionLink[];
   linkPickerOpen: boolean;
@@ -125,6 +168,7 @@ interface ChatState {
 
   // Notion context sources
   notionContextSources: ContextSource[];
+  attachedWebPages: WebPageRef[];
   notionPickerOpen: boolean;
   notionSourcesLoading: boolean;
 
@@ -136,6 +180,7 @@ interface ChatState {
   knowledgeHintMatches: KnowledgeHintMatch[];
   knowledgeHintLoading: boolean;
   knowledgeHintDismissed: boolean;
+  modelRecommendationsEnabled: boolean;
 
   // Thinking / Reasoning mode (per-model)
   thinkingConfig: Record<string, ThinkingConfig>;
@@ -144,12 +189,47 @@ interface ChatState {
   toggleModel: (model: string) => void;
   setSelectedModels: (models: string[]) => void;
   startStreaming: () => void;
-  startStreamingFor: (models: string[]) => void;
+  startStreamingFor: (models: string[], target?: 'observer' | 'parallel' | 'compare' | 'synthesize' | 'handoff') => void;
   appendChunk: (model: string, content: string) => void;
-  markDone: (model: string, error?: string) => void;
+  markDone: (
+    model: string,
+    error?: string,
+    meta?: {
+      stopReason?: string;
+      promptTokens?: number;
+      completionTokens?: number;
+      reasoningTokens?: number;
+      cachedTokens?: number;
+      estimatedCostUsd?: number;
+      pricingSource?: 'static_registry_estimate' | 'provider_usage_estimate' | 'provider_reconciled';
+    }
+  ) => void;
+  markStalled: (
+    model: string,
+    opts?: {
+      target?: 'observer' | 'parallel' | 'compare' | 'synthesize' | 'handoff';
+      retryable?: boolean;
+      error?: string;
+      partialRetained?: boolean;
+    }
+  ) => void;
+  keepPartial: (
+    model: string,
+    target?: 'observer' | 'parallel' | 'compare' | 'synthesize' | 'handoff'
+  ) => void;
+  reconcileCompletedResponse: (
+    model: string,
+    target?: 'observer' | 'parallel' | 'compare' | 'synthesize' | 'handoff'
+  ) => void;
   finishStreaming: () => void;
+  setLastParallelPrompt: (prompt: string | null) => void;
+  setLastObserverPrompt: (prompt: string | null) => void;
+  setLastHandoffInstruction: (instruction: string | null) => void;
+  setLastCompareRequest: (value: ChatState['lastCompareRequest']) => void;
+  setLastSynthesizeRequest: (value: ChatState['lastSynthesizeRequest']) => void;
   setSessionId: (id: string) => void;
   clearResponses: () => void;
+  setLastContextDebug: (debug: Record<string, ContextDebugInfo> | null) => void;
   setTimeline: (entries: TimelineEntry[]) => void;
   addTimelineEntry: (entry: TimelineEntry) => void;
   setHandoffFrom: (model: string | null) => void;
@@ -161,6 +241,13 @@ interface ChatState {
 
   // Synthesize
   setSynthesizerModel: (model: string | null) => void;
+
+  // Observer
+  setObserverConfig: (activeModel: string | null, observerModels: string[]) => void;
+  setObserverSnapshots: (snapshots: ObserverSnapshot[]) => void;
+  upsertObserverSnapshot: (snapshot: ObserverSnapshot) => void;
+  setObserverStatus: (model: string, status: ObserverStatus) => void;
+  setObserverActionLoading: (value: string | null) => void;
 
   // Agent
   setAgentTasks: (tasks: AgentTask[]) => void;
@@ -178,6 +265,8 @@ interface ChatState {
 
   // Session management
   setSessions: (sessions: Session[]) => void;
+  setCurrentSession: (session: Session | null) => void;
+  setTopicActions: (actions: Session[]) => void;
   setSessionDrawerOpen: (open: boolean) => void;
   setLinkedSessions: (links: SessionLink[]) => void;
   setLinkPickerOpen: (open: boolean) => void;
@@ -203,7 +292,7 @@ interface ChatState {
   // Library (Phase 7a)
   fetchLibrary: (opts?: { platform?: string; search?: string; offset?: number }) => Promise<void>;
   selectLibraryConversation: (id: string) => Promise<void>;
-  importFile: (file: File, platform: ImportPlatform) => Promise<ImportProgress>;
+  importFile: (file: File, platform: ImportPlatform, projectName?: string) => Promise<ImportProgress>;
   fetchLibraryStats: () => Promise<void>;
   setLibraryFilter: (filter: { platform?: string; search?: string }) => void;
   setLibraryImporting: (importing: boolean) => void;
@@ -238,6 +327,7 @@ interface ChatState {
 
   // Notion context sources
   setNotionPickerOpen: (open: boolean) => void;
+  setAttachedWebPages: (pages: WebPageRef[]) => void;
   fetchNotionContextSources: (sessionId: string) => Promise<void>;
   attachNotionSource: (sessionId: string, sourceId: string, sourceLabel: string) => Promise<void>;
   detachNotionSource: (id: string) => Promise<void>;
@@ -252,25 +342,47 @@ interface ChatState {
   setKnowledgeHintLoading: (loading: boolean) => void;
   dismissKnowledgeHints: () => void;
   clearKnowledgeHints: () => void;
+  setModelRecommendationsEnabled: (enabled: boolean) => void;
 
   // Thinking actions
   setThinkingConfig: (model: string, config: ThinkingConfig) => void;
   clearThinkingConfig: (model: string) => void;
   appendThinkingChunk: (model: string, content: string) => void;
+  setResponseDebug: (
+    model: string,
+    debug: Partial<NonNullable<ModelResponse['debug']>>,
+    target?: 'observer' | 'parallel' | 'compare' | 'synthesize' | 'handoff'
+  ) => void;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
-  mode: 'parallel',
+  mode: 'observer',
   selectedModels: DEFAULT_MODELS,
-  responses: {},
+  observerResponses: {},
+  parallelResponses: {},
+  compareResponses: {},
+  synthesizeResponses: {},
+  handoffResponses: {},
+  activeStreamTarget: null,
   isStreaming: false,
   sessionId: null,
   timeline: [],
+  lastContextDebug: null,
   handoffFromModel: null,
   handoffToModel: null,
   compareOriginModel: null,
   compareOriginContent: null,
   synthesizerModel: null,
+  observerActiveModel: null,
+  observerModels: [],
+  observerSnapshots: {},
+  observerStatuses: {},
+  observerActionLoading: null,
+  lastParallelPrompt: null,
+  lastObserverPrompt: null,
+  lastHandoffInstruction: null,
+  lastCompareRequest: null,
+  lastSynthesizeRequest: null,
   agentTasks: [],
   agentPlanSteps: [],
   agentPlanReasoning: null,
@@ -282,6 +394,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   // Session management
   sessions: [],
+  currentSession: null,
+  topicActions: [],
   sessionDrawerOpen: false,
   linkedSessions: [],
   linkPickerOpen: false,
@@ -342,6 +456,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   // Notion context sources
   notionContextSources: [],
+  attachedWebPages: [],
   notionPickerOpen: false,
   notionSourcesLoading: false,
 
@@ -353,6 +468,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   knowledgeHintMatches: [],
   knowledgeHintLoading: false,
   knowledgeHintDismissed: false,
+  modelRecommendationsEnabled: true,
 
   // Thinking — default ON for all models that support it, middle preset
   thinkingConfig: Object.fromEntries(
@@ -366,7 +482,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ]),
   ),
 
-  setMode: (mode) => set({ mode, responses: {} }),
+  setMode: (mode) => set({ mode }),
 
   toggleModel: (model) =>
     set((state) => {
@@ -388,66 +504,470 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return set({ selectedModels: capped });
   },
 
+  setObserverConfig: (activeModel, observerModels) =>
+    set({
+      observerActiveModel: activeModel,
+      observerModels,
+    }),
+
+  setObserverSnapshots: (snapshots) =>
+    set({
+      observerSnapshots: Object.fromEntries(snapshots.map((snapshot) => [snapshot.model, snapshot])),
+      observerStatuses: Object.fromEntries(snapshots.map((snapshot) => [snapshot.model, snapshot.status])),
+    }),
+
+  upsertObserverSnapshot: (snapshot) =>
+    set((state) => ({
+      observerSnapshots: {
+        ...state.observerSnapshots,
+        [snapshot.model]: snapshot,
+      },
+      observerStatuses: {
+        ...state.observerStatuses,
+        [snapshot.model]: snapshot.status,
+      },
+    })),
+
+  setObserverStatus: (model, status) =>
+    set((state) => ({
+      observerStatuses: {
+        ...state.observerStatuses,
+        [model]: status,
+      },
+    })),
+
+  setObserverActionLoading: (value) => set({ observerActionLoading: value }),
+
+  setLastParallelPrompt: (prompt) => set({ lastParallelPrompt: prompt }),
+  setLastObserverPrompt: (prompt) => set({ lastObserverPrompt: prompt }),
+  setLastHandoffInstruction: (instruction) => set({ lastHandoffInstruction: instruction }),
+  setLastCompareRequest: (value) => set({ lastCompareRequest: value }),
+  setLastSynthesizeRequest: (value) => set({ lastSynthesizeRequest: value }),
+
   startStreaming: () =>
     set((state) => {
       const responses: Record<string, ModelResponse> = {};
+      const now = Date.now();
       for (const model of state.selectedModels) {
-        responses[model] = { model, content: '', done: false };
+        responses[model] = {
+          model,
+          content: '',
+          done: false,
+          mode: 'parallel',
+          streamStatus: 'streaming',
+          lastChunkAt: now,
+          partialRetained: false,
+          retryable: false,
+          attempt: (state.parallelResponses[model]?.attempt ?? 0) + 1,
+          debug: {
+            chunkCount: 0,
+            contentChars: 0,
+            thinkingChars: 0,
+            lastEvent: 'streaming',
+          },
+        };
       }
-      return { isStreaming: true, responses };
+      return { isStreaming: true, activeStreamTarget: 'parallel', parallelResponses: responses, lastContextDebug: null };
     }),
 
-  startStreamingFor: (models) =>
-    set(() => {
+  startStreamingFor: (models, target = 'parallel') =>
+    set((state) => {
       const responses: Record<string, ModelResponse> = {};
+      const now = Date.now();
+      const previousMap =
+        target === 'observer'
+          ? state.observerResponses
+          : target === 'compare'
+          ? state.compareResponses
+          : target === 'synthesize'
+            ? state.synthesizeResponses
+            : target === 'handoff'
+              ? state.handoffResponses
+              : state.parallelResponses;
       for (const model of models) {
-        responses[model] = { model, content: '', done: false };
+        responses[model] = {
+          model,
+          content: '',
+          done: false,
+          mode: target,
+          streamStatus: previousMap[model]?.content ? 'retrying' : 'streaming',
+          lastChunkAt: now,
+          partialRetained: false,
+          retryable: false,
+          attempt: (previousMap[model]?.attempt ?? 0) + 1,
+          debug: {
+            chunkCount: 0,
+            contentChars: 0,
+            thinkingChars: 0,
+            lastEvent: previousMap[model]?.content ? 'retrying' : 'streaming',
+          },
+        };
       }
-      return { isStreaming: true, responses };
+      return {
+        isStreaming: true,
+        activeStreamTarget: target,
+        observerResponses: target === 'observer' ? responses : get().observerResponses,
+        parallelResponses: target === 'parallel' ? responses : get().parallelResponses,
+        compareResponses: target === 'compare' ? responses : get().compareResponses,
+        synthesizeResponses: target === 'synthesize' ? responses : get().synthesizeResponses,
+        handoffResponses: target === 'handoff' ? responses : get().handoffResponses,
+        lastContextDebug: null,
+      };
     }),
 
   startHandoffStreaming: (toModel) =>
-    set({
+    set((state) => ({
       isStreaming: true,
-      responses: {
-        [toModel]: { model: toModel, content: '', done: false },
+      activeStreamTarget: 'handoff',
+      lastContextDebug: null,
+      handoffResponses: {
+        [toModel]: {
+          model: toModel,
+          content: '',
+          done: false,
+          mode: 'handoff',
+          streamStatus: state.handoffResponses[toModel]?.content ? 'retrying' : 'streaming',
+          lastChunkAt: Date.now(),
+          partialRetained: false,
+          retryable: false,
+          attempt: (state.handoffResponses[toModel]?.attempt ?? 0) + 1,
+          debug: {
+            chunkCount: 0,
+            contentChars: 0,
+            thinkingChars: 0,
+            lastEvent: state.handoffResponses[toModel]?.content ? 'retrying' : 'streaming',
+          },
+        },
       },
-    }),
+    })),
 
   appendChunk: (model, content) =>
     set((state) => {
-      const existing = state.responses[model];
-      if (!existing) return state;
+      const target = state.activeStreamTarget ?? 'parallel';
+      const mapKey =
+        target === 'observer'
+          ? 'observerResponses'
+          : target === 'compare'
+          ? 'compareResponses'
+          : target === 'synthesize'
+            ? 'synthesizeResponses'
+            : target === 'handoff'
+              ? 'handoffResponses'
+              : 'parallelResponses';
+      const responseMap = state[mapKey];
+      const existing = responseMap[model];
+      if (!existing) {
+        return {
+          [mapKey]: {
+            ...responseMap,
+            [model]: {
+              model,
+              content,
+              done: false,
+              mode: target,
+              streamStatus: 'streaming',
+              lastChunkAt: Date.now(),
+              partialRetained: false,
+              retryable: false,
+              debug: {
+                chunkCount: 1,
+                contentChars: content.length,
+                thinkingChars: 0,
+                lastEvent: 'content_chunk',
+              },
+            },
+          },
+        };
+      }
       return {
-        responses: {
-          ...state.responses,
-          [model]: { ...existing, content: existing.content + content },
+        [mapKey]: {
+          ...responseMap,
+          [model]: {
+            ...existing,
+            content: existing.content + content,
+            lastChunkAt: Date.now(),
+            streamStatus: 'streaming',
+            retryable: false,
+            partialRetained: false,
+            error: undefined,
+            debug: {
+              chunkCount: (existing.debug?.chunkCount ?? 0) + 1,
+              contentChars: (existing.debug?.contentChars ?? 0) + content.length,
+              thinkingChars: existing.debug?.thinkingChars ?? 0,
+              stopReason: existing.debug?.stopReason,
+              providerError: undefined,
+              lastEvent: 'content_chunk',
+              note: existing.debug?.note,
+            },
+          },
         },
       };
     }),
 
-  markDone: (model, error) =>
+  markDone: (model, error, meta) =>
     set((state) => {
-      const existing = state.responses[model];
+      const target = state.activeStreamTarget ?? 'parallel';
+      const mapKey =
+        target === 'observer'
+          ? 'observerResponses'
+          : target === 'compare'
+          ? 'compareResponses'
+          : target === 'synthesize'
+            ? 'synthesizeResponses'
+            : target === 'handoff'
+              ? 'handoffResponses'
+              : 'parallelResponses';
+      const responseMap = state[mapKey];
+      const existing = responseMap[model];
+      if (!existing) {
+        return {
+          [mapKey]: {
+            ...responseMap,
+            [model]: {
+              model,
+              content: '',
+              done: true,
+              error,
+              stopReason: meta?.stopReason,
+              promptTokens: meta?.promptTokens,
+              completionTokens: meta?.completionTokens,
+              reasoningTokens: meta?.reasoningTokens,
+              cachedTokens: meta?.cachedTokens,
+              estimatedCostUsd: meta?.estimatedCostUsd,
+              pricingSource: meta?.pricingSource,
+              mode: target,
+              streamStatus: error ? 'error' : 'completed',
+              retryable: Boolean(error && /timed out|timeout|stalled/i.test(error)),
+              partialRetained: Boolean(error),
+              debug: {
+                chunkCount: 0,
+                contentChars: 0,
+                thinkingChars: 0,
+                stopReason: meta?.stopReason,
+                providerError: error,
+                lastEvent: error ? 'error' : 'done',
+              },
+            },
+          },
+        };
+      }
+      return {
+        [mapKey]: {
+          ...responseMap,
+          [model]: {
+            ...existing,
+            done: true,
+            error,
+            stopReason: meta?.stopReason ?? existing.stopReason,
+            promptTokens: meta?.promptTokens ?? existing.promptTokens,
+            completionTokens: meta?.completionTokens ?? existing.completionTokens,
+            reasoningTokens: meta?.reasoningTokens ?? existing.reasoningTokens,
+            cachedTokens: meta?.cachedTokens ?? existing.cachedTokens,
+            estimatedCostUsd: meta?.estimatedCostUsd ?? existing.estimatedCostUsd,
+            pricingSource: meta?.pricingSource ?? existing.pricingSource,
+            streamStatus: error ? 'error' : 'completed',
+            retryable: error ? (existing.retryable || Boolean(error && /timed out|timeout|stalled/i.test(error))) : false,
+            partialRetained: error ? (existing.partialRetained || Boolean(error)) : false,
+            debug: {
+              chunkCount: existing.debug?.chunkCount ?? 0,
+              contentChars: existing.debug?.contentChars ?? 0,
+              thinkingChars: existing.debug?.thinkingChars ?? 0,
+              stopReason: meta?.stopReason ?? existing.debug?.stopReason,
+              providerError: error ?? existing.debug?.providerError,
+              lastEvent: error ? 'error' : 'done',
+              note: existing.debug?.note,
+            },
+          },
+        },
+      };
+    }),
+
+  markStalled: (model, opts) =>
+    set((state) => {
+      const target = opts?.target ?? state.activeStreamTarget ?? 'parallel';
+      const mapKey =
+        target === 'observer'
+          ? 'observerResponses'
+          : target === 'compare'
+          ? 'compareResponses'
+          : target === 'synthesize'
+            ? 'synthesizeResponses'
+            : target === 'handoff'
+              ? 'handoffResponses'
+              : 'parallelResponses';
+      const responseMap = state[mapKey];
+      const existing = responseMap[model];
+      if (!existing) {
+        return {
+          [mapKey]: {
+            ...responseMap,
+            [model]: {
+              model,
+              content: '',
+              done: opts?.retryable ?? false,
+              error: opts?.error,
+              mode: target,
+              streamStatus: 'stalled',
+              retryable: opts?.retryable ?? false,
+              partialRetained: opts?.partialRetained ?? false,
+              debug: {
+                chunkCount: 0,
+                contentChars: 0,
+                thinkingChars: 0,
+                providerError: opts?.error,
+                lastEvent: 'stalled',
+              },
+            },
+          },
+        };
+      }
+      return {
+        [mapKey]: {
+          ...responseMap,
+          [model]: {
+            ...existing,
+            done: opts?.retryable ? true : existing.done,
+            error: opts?.error ?? existing.error,
+            streamStatus: 'stalled',
+            retryable: opts?.retryable ?? existing.retryable ?? false,
+            partialRetained: opts?.partialRetained ?? existing.partialRetained ?? false,
+            debug: {
+              chunkCount: existing.debug?.chunkCount ?? 0,
+              contentChars: existing.debug?.contentChars ?? 0,
+              thinkingChars: existing.debug?.thinkingChars ?? 0,
+              stopReason: existing.debug?.stopReason,
+              providerError: opts?.error ?? existing.debug?.providerError,
+              lastEvent: 'stalled',
+              note: existing.debug?.note,
+            },
+          },
+        },
+      };
+    }),
+
+  keepPartial: (model, target) =>
+    set((state) => {
+      const resolvedTarget = target ?? state.activeStreamTarget ?? 'parallel';
+      const mapKey =
+        resolvedTarget === 'observer'
+          ? 'observerResponses'
+          : resolvedTarget === 'compare'
+          ? 'compareResponses'
+          : resolvedTarget === 'synthesize'
+            ? 'synthesizeResponses'
+            : resolvedTarget === 'handoff'
+              ? 'handoffResponses'
+              : 'parallelResponses';
+      const responseMap = state[mapKey];
+      const existing = responseMap[model];
       if (!existing) return state;
       return {
-        responses: {
-          ...state.responses,
-          [model]: { ...existing, done: true, error },
+        [mapKey]: {
+          ...responseMap,
+          [model]: {
+            ...existing,
+            done: true,
+            streamStatus: 'completed',
+            retryable: false,
+            partialRetained: true,
+            error: undefined,
+            debug: {
+              chunkCount: existing.debug?.chunkCount ?? 0,
+              contentChars: existing.debug?.contentChars ?? 0,
+              thinkingChars: existing.debug?.thinkingChars ?? 0,
+              stopReason: existing.debug?.stopReason,
+              providerError: undefined,
+              lastEvent: 'kept_partial',
+              note: existing.debug?.note,
+            },
+          },
+        },
+      };
+    }),
+
+  reconcileCompletedResponse: (model, target) =>
+    set((state) => {
+      const resolvedTarget = target ?? state.activeStreamTarget ?? 'parallel';
+      const mapKey =
+        resolvedTarget === 'observer'
+          ? 'observerResponses'
+          : resolvedTarget === 'compare'
+          ? 'compareResponses'
+          : resolvedTarget === 'synthesize'
+            ? 'synthesizeResponses'
+            : resolvedTarget === 'handoff'
+              ? 'handoffResponses'
+              : 'parallelResponses';
+      const responseMap = state[mapKey];
+      const existing = responseMap[model];
+      if (!existing || !existing.content.trim()) return state;
+      return {
+        [mapKey]: {
+          ...responseMap,
+          [model]: {
+            ...existing,
+            done: true,
+            error: undefined,
+            streamStatus: 'completed',
+            retryable: false,
+            partialRetained: false,
+            debug: {
+              chunkCount: existing.debug?.chunkCount ?? 0,
+              contentChars: existing.debug?.contentChars ?? 0,
+              thinkingChars: existing.debug?.thinkingChars ?? 0,
+              stopReason: existing.stopReason ?? existing.debug?.stopReason,
+              providerError: undefined,
+              lastEvent: 'done',
+              note: existing.debug?.note,
+            },
+          },
         },
       };
     }),
 
   finishStreaming: () =>
     set((state) => {
-      // Force all models to done: true so UI never shows stale "streaming..." badges
-      const responses = { ...state.responses };
+      const target = state.activeStreamTarget ?? 'parallel';
+      const mapKey =
+        target === 'observer'
+          ? 'observerResponses'
+          : target === 'compare'
+          ? 'compareResponses'
+          : target === 'synthesize'
+            ? 'synthesizeResponses'
+            : target === 'handoff'
+              ? 'handoffResponses'
+              : 'parallelResponses';
+      const responses = { ...state[mapKey] };
       for (const key of Object.keys(responses)) {
         if (!responses[key].done) {
-          responses[key] = { ...responses[key], done: true };
+          responses[key] = {
+            ...responses[key],
+            done: true,
+            streamStatus:
+              responses[key].streamStatus === 'stalled'
+                ? 'stalled'
+                : responses[key].error
+                ? 'error'
+                : 'completed',
+            debug: {
+              chunkCount: responses[key].debug?.chunkCount ?? 0,
+              contentChars: responses[key].debug?.contentChars ?? 0,
+              thinkingChars: responses[key].debug?.thinkingChars ?? 0,
+              stopReason: responses[key].debug?.stopReason,
+              providerError: responses[key].debug?.providerError,
+              lastEvent:
+                responses[key].streamStatus === 'stalled'
+                  ? 'stalled'
+                  : responses[key].error
+                  ? 'error'
+                  : 'done',
+              note: responses[key].debug?.note,
+            },
+          };
         }
       }
-      return { isStreaming: false, responses };
+      return { isStreaming: false, activeStreamTarget: null, [mapKey]: responses };
     }),
 
   setSessionId: (id) => {
@@ -455,7 +975,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return set({ sessionId: id });
   },
 
-  clearResponses: () => set({ responses: {} }),
+  clearResponses: () => set({
+    observerResponses: {},
+    parallelResponses: {},
+    compareResponses: {},
+    synthesizeResponses: {},
+    handoffResponses: {},
+    activeStreamTarget: null,
+    lastContextDebug: null,
+  }),
+  setLastContextDebug: (debug) => set({ lastContextDebug: debug }),
 
   setTimeline: (entries) => set({ timeline: entries }),
 
@@ -506,6 +1035,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   // Session management actions
   setSessions: (sessions) => set({ sessions }),
+  setCurrentSession: (session) => set({ currentSession: session }),
+  setTopicActions: (actions) => set({ topicActions: actions }),
   setSessionDrawerOpen: (open) => set({ sessionDrawerOpen: open }),
   setLinkedSessions: (links) => set({ linkedSessions: links }),
   setLinkPickerOpen: (open) => set({ linkPickerOpen: open }),
@@ -514,13 +1045,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try { localStorage.removeItem('prism_sessionId'); } catch {}
     set({
       sessionId: null,
-      responses: {},
+      observerResponses: {},
+      parallelResponses: {},
+      compareResponses: {},
+      synthesizeResponses: {},
+      handoffResponses: {},
+      activeStreamTarget: null,
       timeline: [],
+      lastContextDebug: null,
       handoffFromModel: null,
       handoffToModel: null,
       compareOriginModel: null,
       compareOriginContent: null,
       synthesizerModel: null,
+      observerActiveModel: null,
+      observerModels: [],
+      observerSnapshots: {},
+      observerStatuses: {},
+      observerActionLoading: null,
+      lastParallelPrompt: null,
+      lastObserverPrompt: null,
+      lastHandoffInstruction: null,
+      lastCompareRequest: null,
+      lastSynthesizeRequest: null,
       agentTasks: [],
       agentPlanSteps: [],
       agentPlanReasoning: null,
@@ -530,9 +1077,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       flowGraph: null,
       flowSelectedNode: null,
       linkedSessions: [],
+      currentSession: null,
+      topicActions: [],
       sessionDrawerOpen: false,
       linkPickerOpen: false,
       notionContextSources: [],
+      attachedWebPages: [],
       notionPickerOpen: false,
       knowledgeHintMatches: [],
       knowledgeHintLoading: false,
@@ -544,13 +1094,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try { localStorage.setItem('prism_sessionId', id); } catch {}
     set({
       sessionId: id,
-      responses: {},
+      observerResponses: {},
+      parallelResponses: {},
+      compareResponses: {},
+      synthesizeResponses: {},
+      handoffResponses: {},
+      activeStreamTarget: null,
       timeline: [],
+      lastContextDebug: null,
       handoffFromModel: null,
       handoffToModel: null,
       compareOriginModel: null,
       compareOriginContent: null,
       synthesizerModel: null,
+      observerActiveModel: null,
+      observerModels: [],
+      observerSnapshots: {},
+      observerStatuses: {},
+      observerActionLoading: null,
+      lastParallelPrompt: null,
+      lastObserverPrompt: null,
+      lastHandoffInstruction: null,
+      lastCompareRequest: null,
+      lastSynthesizeRequest: null,
       agentTasks: [],
       agentPlanSteps: [],
       agentPlanReasoning: null,
@@ -560,8 +1126,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       flowGraph: null,
       flowSelectedNode: null,
       linkedSessions: [],
+      currentSession: null,
+      topicActions: [],
       sessionDrawerOpen: false,
       notionContextSources: [],
+      attachedWebPages: [],
       notionPickerOpen: false,
       knowledgeHintMatches: [],
       knowledgeHintLoading: false,
@@ -633,11 +1202,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  importFile: async (file, platform) => {
+  importFile: async (file, platform, projectName) => {
     set({ libraryImporting: true });
     try {
       const { uploadImportFile } = await import('@/lib/api');
-      const result = await uploadImportFile(file, platform);
+      const result = await uploadImportFile(file, platform, projectName);
       // Refresh library after import
       await get().fetchLibrary();
       await get().fetchLibraryStats();
@@ -702,7 +1271,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ mode: 'library' });
       get().selectLibraryConversation(result.conversationId);
     } else {
-      set({ mode: 'parallel' });
+      set({ mode: 'observer' });
       get().switchSession(result.conversationId);
     }
     get().clearSearch();
@@ -838,13 +1407,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   // Notion context source actions
   setNotionPickerOpen: (open) => set({ notionPickerOpen: open }),
+  setAttachedWebPages: (pages) => set({ attachedWebPages: pages }),
 
   fetchNotionContextSources: async (sessionId) => {
     set({ notionSourcesLoading: true });
     try {
       const { fetchContextSources } = await import('@/lib/api');
       const sources = await fetchContextSources(sessionId);
-      set({ notionContextSources: sources });
+      set({ notionContextSources: sources.filter((source: ContextSource) => source.sourceType === 'notion_page') });
     } catch (err) {
       console.error('[notion] fetch context sources error:', err);
     } finally {
@@ -887,6 +1457,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setKnowledgeHintLoading: (loading) => set({ knowledgeHintLoading: loading }),
   dismissKnowledgeHints: () => set({ knowledgeHintDismissed: true }),
   clearKnowledgeHints: () => set({ knowledgeHintMatches: [], knowledgeHintLoading: false, knowledgeHintDismissed: false }),
+  setModelRecommendationsEnabled: (enabled) => {
+    try { localStorage.setItem('prism_modelRecommendationsEnabled', JSON.stringify(enabled)); } catch {}
+    set({ modelRecommendationsEnabled: enabled });
+  },
 
   // Thinking actions
   setThinkingConfig: (model, config) =>
@@ -903,15 +1477,110 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   appendThinkingChunk: (model, content) =>
     set((state) => {
-      const existing = state.responses[model];
-      if (!existing) return state;
-      return {
-        responses: {
-          ...state.responses,
+      const target = state.activeStreamTarget ?? 'parallel';
+      const mapKey =
+        target === 'observer'
+          ? 'observerResponses'
+          : target === 'compare'
+          ? 'compareResponses'
+          : target === 'synthesize'
+            ? 'synthesizeResponses'
+            : target === 'handoff'
+              ? 'handoffResponses'
+              : 'parallelResponses';
+      const responseMap = state[mapKey];
+      const existing = responseMap[model];
+      if (!existing) {
+        return {
+          [mapKey]: {
+            ...responseMap,
+            [model]: {
+              model,
+              content: '',
+              done: false,
+              mode: target,
+              streamStatus: 'streaming',
+              lastChunkAt: Date.now(),
+              partialRetained: false,
+              retryable: false,
+              thinkingContent: content,
+              debug: {
+                chunkCount: 1,
+                contentChars: 0,
+                thinkingChars: content.length,
+                lastEvent: 'thinking_chunk',
+              },
+            },
+          },
+        };
+      }
+      const update: Partial<ChatState> = {
+        [mapKey]: {
+          ...responseMap,
           [model]: {
             ...existing,
             thinkingContent: (existing.thinkingContent ?? '') + content,
+            lastChunkAt: Date.now(),
+            streamStatus: 'streaming',
+            debug: {
+              chunkCount: (existing.debug?.chunkCount ?? 0) + 1,
+              contentChars: existing.debug?.contentChars ?? 0,
+              thinkingChars: (existing.debug?.thinkingChars ?? 0) + content.length,
+              stopReason: existing.debug?.stopReason,
+              providerError: existing.debug?.providerError,
+              lastEvent: 'thinking_chunk',
+              note: existing.debug?.note,
+            },
           },
+        },
+      };
+      return update;
+    }),
+
+  setResponseDebug: (model, debug, target) =>
+    set((state) => {
+      const resolvedTarget = target ?? state.activeStreamTarget ?? 'parallel';
+      const mapKey =
+        resolvedTarget === 'observer'
+          ? 'observerResponses'
+          : resolvedTarget === 'compare'
+          ? 'compareResponses'
+          : resolvedTarget === 'synthesize'
+            ? 'synthesizeResponses'
+            : resolvedTarget === 'handoff'
+              ? 'handoffResponses'
+              : 'parallelResponses';
+      const responseMap = state[mapKey];
+      const existing = responseMap[model];
+      const nextDebug = {
+        chunkCount: debug.chunkCount ?? existing?.debug?.chunkCount ?? 0,
+        contentChars: debug.contentChars ?? existing?.debug?.contentChars ?? 0,
+        thinkingChars: debug.thinkingChars ?? existing?.debug?.thinkingChars ?? 0,
+        stopReason: debug.stopReason ?? existing?.debug?.stopReason,
+        providerError: debug.providerError ?? existing?.debug?.providerError,
+        lastEvent: debug.lastEvent ?? existing?.debug?.lastEvent,
+        note: debug.note ?? existing?.debug?.note,
+      };
+
+      return {
+        [mapKey]: {
+          ...responseMap,
+          [model]: existing
+            ? {
+                ...existing,
+                debug: nextDebug,
+              }
+            : {
+                model,
+                content: '',
+                done: false,
+                mode: resolvedTarget,
+                streamStatus: 'streaming',
+                lastChunkAt: Date.now(),
+                partialRetained: false,
+                retryable: false,
+                debug: nextDebug,
+              },
         },
       };
     }),

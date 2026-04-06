@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Prism Claude Sync",
+  "version": "0.1.0",
+  "description": "Sync selected Claude conversations into Prism Library.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "http://localhost:3001/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://claude.ai/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "injected.js"
+      ],
+      "matches": [
+        "https://claude.ai/*"
+      ]
+    }
+  ]
+}

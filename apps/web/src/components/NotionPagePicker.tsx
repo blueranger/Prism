@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { fetchNotionPages, attachContextSource, fetchContextSources, detachContextSource } from '@/lib/api';
+import { fetchNotionPages, attachContextSource, fetchContextSources, detachContextSource, fetchNotionStatus, syncNotionPages } from '@/lib/api';
 
 interface NotionPagePickerProps {
   sessionId: string;
@@ -20,14 +20,33 @@ export default function NotionPagePicker({ sessionId, onClose, onSourcesChanged 
 
   // Load pages and existing sources
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
-    Promise.all([
-      fetchNotionPages(),
-      fetchContextSources(sessionId),
-    ]).then(([p, s]) => {
-      setPages(p);
-      setAttachedSources(s);
-    }).finally(() => setLoading(false));
+
+    (async () => {
+      try {
+        const status = await fetchNotionStatus();
+        const primaryAccountId = status.accounts[0]?.accountId;
+        if (primaryAccountId) {
+          await syncNotionPages(primaryAccountId);
+        }
+
+        const [p, s] = await Promise.all([
+          fetchNotionPages(),
+          fetchContextSources(sessionId),
+        ]);
+
+        if (cancelled) return;
+        setPages(p);
+        setAttachedSources(s);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [sessionId]);
 
   // Search

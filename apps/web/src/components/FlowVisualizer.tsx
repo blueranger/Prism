@@ -7,14 +7,16 @@ import { useChatStore } from '@/stores/chat-store';
 import { fetchFlowGraph } from '@/lib/api';
 
 // --- Layout constants ---
-const NODE_W = 200;
+const NODE_W = 300;
 const NODE_H = 70;
 const NODE_RX = 10;
-const ROW_GAP = 110;
-const COL_GAP = 240;
+const ROW_GAP = 120;
 const PAD_TOP = 60;
-const PAD_LEFT = 40;
-const USER_NODE_W = 280;
+const PAD_LEFT = 60;
+const USER_NODE_W = 760;
+const ACTION_NODE_W = 360;
+const BRANCH_GAP = 36;
+const CANVAS_W = 1100;
 /** Horizontal padding inside node for text */
 const TEXT_PAD = 10;
 
@@ -24,6 +26,7 @@ const MODEL_COLORS: Record<string, { bg: string; border: string; text: string }>
   'claude-sonnet-4-20250514':  { bg: '#261a2e', border: '#a855f7', text: '#d8b4fe' },
   'gemini-2.5-flash':          { bg: '#1a2e26', border: '#22c55e', text: '#86efac' },
   user:                        { bg: '#262626', border: '#6b7280', text: '#d1d5db' },
+  action:                      { bg: '#2d1f14', border: '#f59e0b', text: '#fcd34d' },
 };
 const DEFAULT_COLOR = { bg: '#1f1f1f', border: '#f97316', text: '#fdba74' };
 
@@ -33,7 +36,13 @@ const EDGE_STYLES: Record<FlowConnectionType, { stroke: string; dasharray: strin
   handoff:    { stroke: '#f97316', dasharray: '8 4',    label: 'Handoff' },
   compare:    { stroke: '#a855f7', dasharray: '4 4',    label: 'Compare' },
   synthesize: { stroke: '#22c55e', dasharray: '',       label: 'Synthesize' },
+  observer:   { stroke: '#10b981', dasharray: '',       label: 'Observer' },
+  observer_review: { stroke: '#14b8a6', dasharray: '4 4', label: 'Observer Review' },
+  observer_alternative: { stroke: '#0ea5e9', dasharray: '4 4', label: 'Alternative' },
+  observer_synthesize: { stroke: '#34d399', dasharray: '', label: 'Observer Synthesize' },
   agent:      { stroke: '#ef4444', dasharray: '6 3',    label: 'Agent' },
+  action_spawn: { stroke: '#f59e0b', dasharray: '8 4', label: 'Spawn Action' },
+  action_writeback: { stroke: '#38bdf8', dasharray: '3 4', label: 'Write Back' },
 };
 
 // --- Mode filter labels ---
@@ -43,7 +52,13 @@ const MODE_FILTERS: { id: FlowConnectionType | 'all'; label: string }[] = [
   { id: 'handoff',    label: 'Handoff' },
   { id: 'compare',    label: 'Compare' },
   { id: 'synthesize', label: 'Synthesize' },
+  { id: 'observer', label: 'Observer' },
+  { id: 'observer_review', label: 'Observer Review' },
+  { id: 'observer_alternative', label: 'Alternative' },
+  { id: 'observer_synthesize', label: 'Observer Synth' },
   { id: 'agent',      label: 'Agent' },
+  { id: 'action_spawn', label: 'Action' },
+  { id: 'action_writeback', label: 'Writeback' },
 ];
 
 /** Positioned node for rendering. */
@@ -76,69 +91,129 @@ export default function FlowVisualizer() {
   // --- Layout calculation ---
   const layout = useCallback((): { nodes: PositionedNode[]; width: number; height: number } => {
     if (!flowGraph || flowGraph.nodes.length === 0) {
-      return { nodes: [], width: 800, height: 400 };
+      return { nodes: [], width: CANVAS_W + PAD_LEFT * 2, height: 400 };
     }
 
     const { nodes } = flowGraph;
-
-    // Assign columns based on sourceModel
-    const modelOrder = Object.keys(MODELS);
-    const modelCol = new Map<string, number>();
-    modelOrder.forEach((m, i) => modelCol.set(m, i));
-
-    // Group nodes into rows by timestamp clustering.
-    // Each user message starts a new "row group".
-    // Consecutive assistant messages with the SAME mode fan out horizontally on one row.
-    // When the mode changes (e.g. compare → synthesize), a new row begins.
+    const mainCenterX = PAD_LEFT + CANVAS_W / 2;
+    const userX = mainCenterX - USER_NODE_W / 2;
     const positioned: PositionedNode[] = [];
+    const positionedMap = new Map<string, PositionedNode>();
+    const nodesById = new Map(nodes.map((node) => [node.id, node]));
+    const outgoing = new Map<string, FlowEdge[]>();
+    const incoming = new Map<string, FlowEdge[]>();
+
+    for (const edge of flowGraph.edges) {
+      if (!outgoing.has(edge.from)) outgoing.set(edge.from, []);
+      if (!incoming.has(edge.to)) incoming.set(edge.to, []);
+      outgoing.get(edge.from)!.push(edge);
+      incoming.get(edge.to)!.push(edge);
+    }
+
+    const placeNode = (node: FlowNode, row: number, x: number, w: number) => {
+      const placed: PositionedNode = {
+        ...node,
+        x,
+        y: PAD_TOP + row * ROW_GAP,
+        w,
+        h: NODE_H,
+      };
+      positioned.push(placed);
+      positionedMap.set(node.id, placed);
+    };
+
+    const placeSpread = (group: FlowNode[], row: number, centerX: number, width: number) => {
+      const totalWidth = group.length * width + Math.max(0, group.length - 1) * BRANCH_GAP;
+      const startX = centerX - totalWidth / 2;
+      group.forEach((node, index) => {
+        placeNode(node, row, startX + index * (width + BRANCH_GAP), width);
+      });
+    };
+
+    const handled = new Set<string>();
     let currentRow = 0;
 
     for (let i = 0; i < nodes.length; i++) {
       const node = nodes[i];
+      if (handled.has(node.id)) continue;
 
       if (node.type === 'user') {
-        // User nodes span the center
-        const totalWidth = modelOrder.length * COL_GAP;
-        positioned.push({
-          ...node,
-          x: PAD_LEFT + (totalWidth - USER_NODE_W) / 2,
-          y: PAD_TOP + currentRow * ROW_GAP,
-          w: USER_NODE_W,
-          h: NODE_H,
-        });
-        currentRow++;
-      } else {
-        // If this assistant node has a different mode from the previous
-        // assistant node on the same row, start a new row first.
-        const prev = nodes[i - 1];
-        if (
-          prev &&
-          prev.type === 'assistant' &&
-          prev.role === 'assistant' &&
-          node.mode !== prev.mode
-        ) {
-          currentRow++;
+        placeNode(node, currentRow, userX, USER_NODE_W);
+        handled.add(node.id);
+
+        const parallelChildren = (outgoing.get(node.id) ?? [])
+          .filter((edge) => edge.type === 'parallel')
+          .map((edge) => nodesById.get(edge.to))
+          .filter((child): child is FlowNode => child !== undefined && !handled.has(child.id));
+
+        if (parallelChildren.length > 0) {
+          currentRow += 1;
+          placeSpread(parallelChildren, currentRow, mainCenterX, NODE_W);
+          parallelChildren.forEach((child) => handled.add(child.id));
         }
 
-        // Assistant/agent nodes position by their model column
-        const col = modelCol.get(node.sourceModel) ?? modelOrder.length;
-        positioned.push({
-          ...node,
-          x: PAD_LEFT + col * COL_GAP + (COL_GAP - NODE_W) / 2,
-          y: PAD_TOP + currentRow * ROW_GAP,
-          w: NODE_W,
-          h: NODE_H,
-        });
+        currentRow += 1;
+        continue;
+      }
 
-        // Advance row when the next node is not a same-mode assistant
-        const next = nodes[i + 1];
-        if (!next || next.type === 'user' || next.type === 'agent') {
-          currentRow++;
+      const compareParents = (incoming.get(node.id) ?? []).filter((edge) => edge.type === 'compare');
+      if (compareParents.length > 0) {
+        const originId = compareParents[0].from;
+        const siblingIds = (outgoing.get(originId) ?? [])
+          .filter((edge) => edge.type === 'compare')
+          .map((edge) => edge.to);
+        const siblings = siblingIds
+          .map((id) => nodesById.get(id))
+          .filter((candidate): candidate is FlowNode => candidate !== undefined && !handled.has(candidate.id));
+
+        if (siblings.length > 0) {
+          const originPlaced = positionedMap.get(originId);
+          const centerX = originPlaced ? originPlaced.x + originPlaced.w / 2 : mainCenterX;
+          placeSpread(siblings, currentRow, centerX, NODE_W);
+          siblings.forEach((sibling) => handled.add(sibling.id));
+          currentRow += 1;
+          continue;
         }
       }
+
+      const synthParents = (incoming.get(node.id) ?? []).filter((edge) => edge.type === 'synthesize');
+      if (synthParents.length > 0) {
+        const parentCenters = synthParents
+          .map((edge) => positionedMap.get(edge.from))
+          .filter((parent): parent is PositionedNode => Boolean(parent))
+          .map((parent) => parent.x + parent.w / 2);
+        const centerX = parentCenters.length > 0
+          ? parentCenters.reduce((sum, value) => sum + value, 0) / parentCenters.length
+          : mainCenterX;
+        placeNode(node, currentRow, centerX - NODE_W / 2, NODE_W);
+        handled.add(node.id);
+        currentRow += 1;
+        continue;
+      }
+
+      const handoffParents = (incoming.get(node.id) ?? []).filter((edge) => edge.type === 'handoff');
+      if (handoffParents.length > 0) {
+        const parent = positionedMap.get(handoffParents[0].from);
+        const x = parent ? parent.x : mainCenterX - NODE_W / 2;
+        placeNode(node, currentRow, x, NODE_W);
+        handled.add(node.id);
+        currentRow += 1;
+        continue;
+      }
+
+      if (node.type === 'action') {
+        placeNode(node, currentRow, PAD_LEFT + CANVAS_W - ACTION_NODE_W, ACTION_NODE_W);
+        handled.add(node.id);
+        currentRow += 1;
+        continue;
+      }
+
+      placeNode(node, currentRow, mainCenterX - NODE_W / 2, NODE_W);
+      handled.add(node.id);
+      currentRow += 1;
     }
 
-    const maxX = Math.max(...positioned.map((n) => n.x + n.w), 800) + PAD_LEFT;
+    const maxX = Math.max(...positioned.map((n) => n.x + n.w), CANVAS_W) + PAD_LEFT;
     const maxY = Math.max(...positioned.map((n) => n.y + n.h), 400) + PAD_TOP;
 
     return { nodes: positioned, width: maxX, height: maxY };
@@ -236,25 +311,15 @@ export default function FlowVisualizer() {
               ))}
             </defs>
 
-            {/* Column headers */}
-            {Object.keys(MODELS).map((modelId, i) => {
-              const color = MODEL_COLORS[modelId] ?? DEFAULT_COLOR;
-              const centerX = PAD_LEFT + i * COL_GAP + COL_GAP / 2;
-              return (
-                <text
-                  key={modelId}
-                  x={centerX}
-                  y={24}
-                  textAnchor="middle"
-                  fill={color.text}
-                  fontSize="12"
-                  fontWeight="600"
-                  opacity="0.5"
-                >
-                  {MODELS[modelId].displayName}
-                </text>
-              );
-            })}
+            <text
+              x={PAD_LEFT}
+              y={26}
+              fill="#6b7280"
+              fontSize="12"
+              fontWeight="600"
+            >
+              Session flow in time order
+            </text>
 
             {/* Edges */}
             {filteredEdges.map((edge) => {
@@ -270,8 +335,8 @@ export default function FlowVisualizer() {
               const endX = to.x + to.w / 2;
               const endY = to.y;
 
-              // Use a curved path for cross-column edges
-              const isStraight = Math.abs(startX - endX) < 10;
+              // Use a curved path only when action/writeback creates a visible branch
+              const isStraight = Math.abs(startX - endX) < 24;
               const midY = (startY + endY) / 2;
 
               const path = isStraight
@@ -311,7 +376,10 @@ export default function FlowVisualizer() {
             {positioned.map((node) => {
               const isUser = node.type === 'user';
               const isAgent = node.type === 'agent';
-              const color = isAgent
+              const isAction = node.type === 'action';
+              const color = isAction
+                ? MODEL_COLORS.action
+                : isAgent
                 ? DEFAULT_COLOR
                 : MODEL_COLORS[node.sourceModel] ?? DEFAULT_COLOR;
               const isSelected = selectedNode?.id === node.id;
@@ -323,8 +391,10 @@ export default function FlowVisualizer() {
 
               const displayName = isUser
                 ? 'User'
+                : isAction
+                  ? node.actionType ? `${node.actionType} action` : 'Action'
                 : isAgent
-                  ? node.sourceModel
+                  ? 'Agent'
                   : MODELS[node.sourceModel]?.displayName ?? node.sourceModel;
 
               // Truncate content for preview — use a safe char limit
@@ -371,7 +441,7 @@ export default function FlowVisualizer() {
                   />
 
                   <g clipPath={`url(#${clipId})`}>
-                    {/* Model label */}
+                    {/* Node label */}
                     <text
                       x={node.x + TEXT_PAD}
                       y={node.y + 18}
@@ -396,10 +466,22 @@ export default function FlowVisualizer() {
                       </text>
                     )}
 
+                    {/* Model / execution detail */}
+                    {!isUser && !isAction && (
+                      <text
+                        x={node.x + TEXT_PAD}
+                        y={node.y + 31}
+                        fill="#6b7280"
+                        fontSize="9"
+                      >
+                        {MODELS[node.sourceModel]?.displayName ?? node.sourceModel}
+                      </text>
+                    )}
+
                     {/* Content preview — up to 2 lines */}
                     <text
                       x={node.x + TEXT_PAD}
-                      y={node.y + 36}
+                      y={node.y + (isUser || isAction ? 36 : 45)}
                       fill="#9ca3af"
                       fontSize="9"
                     >
@@ -408,7 +490,7 @@ export default function FlowVisualizer() {
                     {contentLine2 && (
                       <text
                         x={node.x + TEXT_PAD}
-                        y={node.y + 50}
+                        y={node.y + (isUser || isAction ? 50 : 58)}
                         fill="#9ca3af"
                         fontSize="9"
                       >
@@ -430,11 +512,17 @@ export default function FlowVisualizer() {
                 <span
                   className="text-sm font-semibold"
                   style={{
-                    color: (MODEL_COLORS[selectedNode.sourceModel] ?? DEFAULT_COLOR).text,
+                    color: (
+                      selectedNode.type === 'action'
+                        ? MODEL_COLORS.action
+                        : MODEL_COLORS[selectedNode.sourceModel]
+                    )?.text ?? DEFAULT_COLOR.text,
                   }}
                 >
                   {selectedNode.type === 'user'
                     ? 'User'
+                    : selectedNode.type === 'action'
+                      ? selectedNode.content
                     : MODELS[selectedNode.sourceModel]?.displayName ?? selectedNode.sourceModel}
                 </span>
                 <span
@@ -459,6 +547,20 @@ export default function FlowVisualizer() {
               {new Date(selectedNode.timestamp).toLocaleString()}
               <span className="ml-2">ID: {selectedNode.id.slice(0, 8)}</span>
             </div>
+
+            {selectedNode.type === 'action' && (
+              <div className="border-b border-gray-800 px-4 py-3 text-xs text-gray-400 space-y-1">
+                <div>Type: {selectedNode.actionType ?? 'custom'}</div>
+                <div>Status: {selectedNode.actionStatus ?? 'draft'}</div>
+                {selectedNode.targetLabel && <div>Target: {selectedNode.targetLabel}</div>}
+                {selectedNode.parentSessionId && <div>Parent: {selectedNode.parentSessionId.slice(0, 8)}</div>}
+                {selectedNode.resultSummary && (
+                  <div className="pt-1 text-gray-300">
+                    Result: {selectedNode.resultSummary}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="flex-1 p-4 overflow-auto">
               <p className="text-gray-300 text-sm whitespace-pre-wrap leading-relaxed">

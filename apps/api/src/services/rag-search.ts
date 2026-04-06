@@ -12,6 +12,7 @@ import {
   RAGSearchQuery,
   RAGSearchResponse,
   RAGSearchResult,
+  RAGSourceMetadata,
   TextChunk,
 } from '@prism/shared';
 import {
@@ -48,6 +49,124 @@ function rowToTextChunk(row: any): TextChunk {
     tokenCount: row.token_count,
     createdAt: row.created_at,
   };
+}
+
+function safeJsonParse(value: string | null | undefined): Record<string, any> | undefined {
+  if (!value) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function buildSourceMetadata(chunk: TextChunk, db: ReturnType<typeof getDb>): RAGSourceMetadata | undefined {
+  if (chunk.sourceType === 'uploaded_file') {
+    const fileRow = db.prepare(`
+      SELECT id, session_id, created_at, updated_at
+      FROM uploaded_files
+      WHERE id = ?
+    `).get(chunk.sourceId) as {
+      id: string;
+      session_id: string | null;
+      created_at: number;
+      updated_at: number | null;
+    } | undefined;
+
+    if (!fileRow) return undefined;
+
+    return {
+      sourceType: chunk.sourceType,
+      sourceId: chunk.sourceId,
+      sessionId: fileRow.session_id ?? null,
+      sourceCreatedAt: fileRow.created_at,
+      sourceUpdatedAt: fileRow.updated_at ?? null,
+      sourceLastActivityAt: fileRow.updated_at ?? fileRow.created_at,
+    };
+  }
+
+  if (chunk.sourceType === 'message') {
+    const sid = chunk.sessionId || chunk.sourceId;
+    const sessionRow = db.prepare(`
+      SELECT
+        s.id,
+        s.created_at,
+        s.updated_at,
+        (SELECT MIN(timestamp) FROM messages WHERE session_id = s.id) as first_message_at,
+        (SELECT MAX(timestamp) FROM messages WHERE session_id = s.id) as last_message_at
+      FROM sessions s
+      WHERE s.id = ?
+    `).get(sid) as {
+      id: string;
+      created_at: number;
+      updated_at: number;
+      first_message_at: number | null;
+      last_message_at: number | null;
+    } | undefined;
+
+    if (!sessionRow) return undefined;
+
+    return {
+      sourceType: chunk.sourceType,
+      sourceId: chunk.sourceId,
+      sessionId: sid,
+      sourceCreatedAt: sessionRow.first_message_at ?? sessionRow.created_at,
+      sourceUpdatedAt: sessionRow.updated_at,
+      sourceLastActivityAt: sessionRow.last_message_at ?? sessionRow.updated_at,
+    };
+  }
+
+  if (chunk.sourceType === 'imported_conversation') {
+    const convRow = db.prepare(`
+      SELECT
+        ic.id,
+        ic.source_platform,
+        ic.created_at,
+        ic.updated_at,
+        ic.metadata,
+        iss.project_name,
+        iss.workspace_name,
+        iss.last_synced_at,
+        iss.source_updated_at,
+        (SELECT MIN(timestamp) FROM imported_messages WHERE conversation_id = ic.id) as first_message_at,
+        (SELECT MAX(timestamp) FROM imported_messages WHERE conversation_id = ic.id) as last_message_at
+      FROM imported_conversations ic
+      LEFT JOIN import_sync_state iss ON iss.conversation_id = ic.id
+      WHERE ic.id = ?
+    `).get(chunk.sourceId) as {
+      id: string;
+      source_platform: string;
+      created_at: string;
+      updated_at: string | null;
+      metadata: string | null;
+      project_name: string | null;
+      workspace_name: string | null;
+      last_synced_at: string | null;
+      source_updated_at: string | null;
+      first_message_at: string | null;
+      last_message_at: string | null;
+    } | undefined;
+
+    if (!convRow) return undefined;
+
+    const metadata = safeJsonParse(convRow.metadata);
+
+    return {
+      sourceType: chunk.sourceType,
+      sourceId: chunk.sourceId,
+      conversationId: chunk.sourceId,
+      sourcePlatform: convRow.source_platform,
+      projectName: convRow.project_name ?? metadata?.projectName ?? null,
+      workspaceName: convRow.workspace_name ?? metadata?.workspaceName ?? null,
+      model: metadata?.defaultModelSlug ?? null,
+      sourceCreatedAt: convRow.first_message_at ?? convRow.created_at,
+      sourceUpdatedAt: convRow.source_updated_at ?? convRow.updated_at ?? null,
+      sourceLastActivityAt: convRow.last_message_at ?? convRow.updated_at ?? convRow.created_at,
+      sourceSyncedAt: convRow.last_synced_at ?? null,
+    };
+  }
+
+  return undefined;
 }
 
 /**
@@ -435,6 +554,7 @@ export async function ragSearch(query: RAGSearchQuery): Promise<RAGSearchRespons
           sourceLabel,
           snippet,
           matchType,
+          sourceMeta: buildSourceMetadata(chunk, db),
         });
       } catch (error) {
         logError(`Failed to process result chunk ${combined.chunkId}:`, error);

@@ -61,12 +61,17 @@ export default function SessionDrawer() {
   };
 
   const handleDelete = async (id: string) => {
-    await deleteSessionApi(id);
+    const ok = await deleteSessionApi(id);
+    if (!ok) {
+      console.error('[SessionDrawer] Failed to delete session:', id);
+      return;
+    }
     setSessions((prev) => prev.filter((s) => s.id !== id));
     setConfirmDeleteId(null);
     // If we deleted the current session, start fresh
     if (id === currentSessionId) {
       useChatStore.getState().newSession();
+      useChatStore.getState().setMode('observer');
     }
   };
 
@@ -240,7 +245,11 @@ export default function SessionDrawer() {
 
         {sessions.map((session) => {
           const isCurrent = session.id === currentSessionId;
-          const displayTitle = session.title || session.preview || session.id.slice(0, 8);
+          const displayTitle =
+            session.actionTitle ||
+            session.title ||
+            session.preview ||
+            session.id.slice(0, 8);
 
           return (
             <div
@@ -268,8 +277,25 @@ export default function SessionDrawer() {
                     onClick={() => handleSwitch(session.id)}
                     className="flex-1 text-left"
                   >
+                    <div className="mb-1 flex items-center gap-1.5">
+                      <span
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${
+                          session.sessionType === 'action'
+                            ? 'bg-amber-900/40 text-amber-300'
+                            : 'bg-slate-800 text-slate-300'
+                        }`}
+                      >
+                        {session.sessionType}
+                      </span>
+                      {session.sessionType === 'action' && session.actionType && (
+                        <span className="text-[10px] text-gray-500">{session.actionType}</span>
+                      )}
+                      {session.sessionType === 'action' && session.actionStatus && (
+                        <span className="text-[10px] text-gray-500">{session.actionStatus}</span>
+                      )}
+                    </div>
                     <span
-                      className="text-sm text-gray-200 truncate block"
+                      className="block text-sm text-gray-200 whitespace-normal break-words leading-5"
                       onDoubleClick={(e) => {
                         e.stopPropagation();
                         setEditingId(session.id);
@@ -320,6 +346,12 @@ export default function SessionDrawer() {
                 <span className="text-xs text-gray-500">
                   {formatRelativeTime(session.updatedAt)}
                 </span>
+                {session.actionTarget && (
+                  <>
+                    <span className="text-xs text-gray-600">&middot;</span>
+                    <span className="truncate text-xs text-gray-500">{session.actionTarget}</span>
+                  </>
+                )}
 
                 {/* Model color dots */}
                 <div className="flex gap-1 ml-auto">

@@ -4,6 +4,7 @@ import type { OperationMode } from '@prism/shared';
 import { useChatStore } from '@/stores/chat-store';
 
 const MODES: { id: OperationMode; label: string; description: string }[] = [
+  { id: 'observer', label: 'Observer', description: 'Work with one active model while others watch silently' },
   { id: 'parallel', label: 'Parallel', description: 'Send to all models at once' },
   { id: 'handoff', label: 'Handoff', description: 'Transfer context between models' },
   { id: 'compare', label: 'Compare', description: 'Cross-model evaluation and critique' },
@@ -13,6 +14,9 @@ const MODES: { id: OperationMode; label: string; description: string }[] = [
   { id: 'communication', label: 'Comms', description: 'Monitor and reply to external messages' },
   { id: 'library', label: 'Library', description: 'Browse imported conversation archives' },
   { id: 'knowledge', label: 'Knowledge', description: 'Explore knowledge graph from conversations' },
+  { id: 'memory', label: 'Memory', description: 'Review curated assistant memory' },
+  { id: 'triggers', label: 'Triggers', description: 'Review trigger candidates, schedules, and history' },
+  { id: 'costs', label: 'Costs', description: 'Track per-turn, session, and monthly LLM spend' },
   { id: 'provenance', label: 'Provenance', description: 'Track & trace AI outputs' },
   { id: 'rag', label: 'KB', description: 'Search & ask questions across your knowledge base' },
 ];

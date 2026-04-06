@@ -9,7 +9,19 @@ export function saveMessage(
   role: Message['role'],
   content: string,
   sourceModel: string,
-  opts?: { handoffId?: string; handoffFrom?: string; mode?: string }
+  opts?: {
+    handoffId?: string;
+    handoffFrom?: string;
+    mode?: string;
+    usage?: {
+      promptTokens?: number;
+      completionTokens?: number;
+      reasoningTokens?: number;
+      cachedTokens?: number;
+    };
+    estimatedCostUsd?: number;
+    pricingSource?: Message['pricingSource'];
+  }
 ): Message {
   const db = getDb();
   const tokenCount = estimateTokens(content);
@@ -25,15 +37,26 @@ export function saveMessage(
     handoffId: opts?.handoffId ?? null,
     handoffFrom: opts?.handoffFrom ?? null,
     mode,
+    promptTokens: opts?.usage?.promptTokens ?? null,
+    completionTokens: opts?.usage?.completionTokens ?? null,
+    reasoningTokens: opts?.usage?.reasoningTokens ?? null,
+    cachedTokens: opts?.usage?.cachedTokens ?? null,
+    estimatedCostUsd: opts?.estimatedCostUsd ?? null,
+    pricingSource: opts?.pricingSource ?? null,
   };
 
   db.prepare(
-    `INSERT INTO messages (id, session_id, role, content, source_model, timestamp, token_count, handoff_id, handoff_from, mode)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO messages (
+      id, session_id, role, content, source_model, timestamp, token_count, handoff_id, handoff_from, mode,
+      prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens, estimated_cost_usd, pricing_source
+    )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     message.id, message.sessionId, message.role, message.content,
     message.sourceModel, message.timestamp, message.tokenCount,
-    message.handoffId, message.handoffFrom, message.mode
+    message.handoffId, message.handoffFrom, message.mode,
+    message.promptTokens, message.completionTokens, message.reasoningTokens,
+    message.cachedTokens, message.estimatedCostUsd, message.pricingSource
   );
 
   // Auto-track session
@@ -59,7 +82,10 @@ export function getSessionMessages(sessionId: string): Message[] {
     .prepare(
       `SELECT id, session_id as sessionId, role, content, source_model as sourceModel,
               timestamp, token_count as tokenCount, handoff_id as handoffId,
-              handoff_from as handoffFrom, mode
+              handoff_from as handoffFrom, mode,
+              prompt_tokens as promptTokens, completion_tokens as completionTokens,
+              reasoning_tokens as reasoningTokens, cached_tokens as cachedTokens,
+              estimated_cost_usd as estimatedCostUsd, pricing_source as pricingSource
        FROM messages WHERE session_id = ? ORDER BY timestamp ASC`
     )
     .all(sessionId) as Message[];

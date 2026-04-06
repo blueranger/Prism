@@ -10,6 +10,7 @@ import {
   createNotionWrite,
   getNotionWrites,
   upsertNotionPage,
+  pruneNotionPagesForAccount,
 } from '../memory/notion-store';
 import { ConnectorRegistry } from '../connectors/registry';
 import { NotionConnector } from '../connectors/notion';
@@ -116,6 +117,8 @@ router.post('/sync', async (req, res) => {
       if (!connector) continue;
       const threads = await connector.fetchThreads();
       totalPages += threads.length;
+      const livePageIds = threads.map((thread) => thread.externalId);
+      pruneNotionPagesForAccount(acct.id, livePageIds);
 
       // Also fetch page content and cache in notion_pages
       const { upsertNotionPage } = await import('../memory/notion-store');

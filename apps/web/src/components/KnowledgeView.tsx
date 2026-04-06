@@ -1,11 +1,12 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
+import { fetchKnowledgeRelations } from '@/lib/api';
 import { useChatStore } from '@/stores/chat-store';
 import KnowledgeGraph from './KnowledgeGraph';
 import EntityDetail from './EntityDetail';
 import TagCloud from './TagCloud';
-import type { EntityType } from '@prism/shared';
+import type { EntityType, RelationshipEvidence } from '@prism/shared';
 
 const ENTITY_TABS: { id: EntityType | 'all'; label: string }[] = [
   { id: 'all', label: 'All' },
@@ -20,6 +21,7 @@ const ENTITY_TABS: { id: EntityType | 'all'; label: string }[] = [
 export default function KnowledgeView() {
   const [entityFilter, setEntityFilter] = useState<EntityType | 'all'>('all');
   const [entitySearch, setEntitySearch] = useState('');
+  const [relations, setRelations] = useState<RelationshipEvidence[]>([]);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const entities = useChatStore((s) => s.knowledgeEntities);
@@ -41,6 +43,7 @@ export default function KnowledgeView() {
     fetchTags();
     fetchStats();
     fetchGraph();
+    void fetchKnowledgeRelations({ limit: 12 }).then(setRelations);
   }, [fetchEntities, fetchTags, fetchStats, fetchGraph]);
 
   // Poll extraction progress when running
@@ -60,6 +63,7 @@ export default function KnowledgeView() {
         fetchTags();
         fetchStats();
         fetchGraph();
+        void fetchKnowledgeRelations({ limit: 12 }).then(setRelations);
       }
     }
     return () => {
@@ -216,6 +220,37 @@ export default function KnowledgeView() {
         {/* Right: Entity detail */}
         <div className="w-64 flex-shrink-0 flex flex-col min-h-0 border-l border-gray-800 pl-3">
           <EntityDetail />
+          <div className="mt-3 rounded-lg border border-gray-800 bg-gray-900/60 p-3">
+            <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-400">Relationship Routing</div>
+            <div className="space-y-2">
+              {relations.length === 0 ? (
+                <div className="text-[11px] text-gray-500">No routed relationship facts yet.</div>
+              ) : (
+                relations.map((relation) => (
+                  <div key={relation.id} className="rounded border border-gray-800 bg-gray-950/40 px-2.5 py-2 text-[11px]">
+                    <div className="text-gray-200">
+                      {relation.sourceEntityName} {relation.relationType} {relation.targetEntityName}
+                    </div>
+                    <div className="mt-1 flex flex-wrap gap-1.5">
+                      <span className="rounded bg-gray-800 px-1.5 py-0.5 text-[10px] text-gray-300">
+                        {relation.routingDecision === 'graph_only'
+                          ? 'Graph-only'
+                          : relation.routingDecision === 'memory_candidate'
+                            ? 'Memory candidate'
+                            : 'Trigger candidate'}
+                      </span>
+                      <span className="rounded bg-gray-800 px-1.5 py-0.5 text-[10px] text-gray-500">
+                        mentions {relation.mentionCount}
+                      </span>
+                    </div>
+                    {relation.promotionReason && (
+                      <div className="mt-1 text-[10px] text-gray-500">reason: {relation.promotionReason}</div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>

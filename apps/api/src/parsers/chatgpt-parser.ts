@@ -11,22 +11,30 @@ export class ChatGPTParser implements ConversationParser {
 
     for (const conv of data) {
       const convId = uuid();
-      const convMessages = this.flattenMapping(conv.mapping, convId);
+      const createdAt = this.toIsoTimestamp(conv.create_time, new Date(0).toISOString());
+      const updatedAt = conv.update_time
+        ? this.toIsoTimestamp(conv.update_time, createdAt)
+        : undefined;
+      const convMessages = this.flattenMapping(conv.mapping, convId, createdAt);
 
       conversations.push({
         id: convId,
         sourcePlatform: 'chatgpt',
         originalId: conv.id,
         title: conv.title || 'Untitled',
-        createdAt: new Date((conv.create_time || 0) * 1000).toISOString(),
-        updatedAt: conv.update_time
-          ? new Date(conv.update_time * 1000).toISOString()
-          : undefined,
+        createdAt,
+        updatedAt,
         messageCount: convMessages.length,
         importBatchId: batchId,
         metadata: {
           conversationTemplateId: conv.conversation_template_id,
           defaultModelSlug: conv.default_model_slug,
+          currentNode: conv.current_node,
+          isArchived: conv.is_archived,
+          workspaceId: conv.workspace_id ?? conv.workspaceId,
+          workspaceName: conv.workspace_name ?? conv.workspaceName,
+          accountId: conv.account_id ?? conv.accountId,
+          ...((conv.metadata && typeof conv.metadata === 'object') ? conv.metadata : {}),
         },
       });
 
@@ -37,7 +45,8 @@ export class ChatGPTParser implements ConversationParser {
 
   private flattenMapping(
     mapping: Record<string, any>,
-    conversationId: string
+    conversationId: string,
+    fallbackTimestamp: string
   ): ImportedMessage[] {
     const messages: ImportedMessage[] = [];
     const nodeMap = mapping;
@@ -82,8 +91,8 @@ export class ChatGPTParser implements ConversationParser {
               content,
               sourceModel: node.message.metadata?.model_slug || undefined,
               timestamp: node.message.create_time
-                ? new Date(node.message.create_time * 1000).toISOString()
-                : new Date().toISOString(),
+                ? this.toIsoTimestamp(node.message.create_time, fallbackTimestamp)
+                : fallbackTimestamp,
               parentMessageId: node.parent || undefined,
               metadata: {
                 originalNodeId: nodeId,
@@ -102,5 +111,12 @@ export class ChatGPTParser implements ConversationParser {
     }
 
     return messages;
+  }
+
+  private toIsoTimestamp(value: unknown, fallback: string): string {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return new Date(value * 1000).toISOString();
+    }
+    return fallback;
   }
 }

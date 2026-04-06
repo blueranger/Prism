@@ -13,8 +13,9 @@ export default function SynthesizePanel() {
   const [instruction, setInstruction] = useState('');
   const isStreaming = useChatStore((s) => s.isStreaming);
   const sessionId = useChatStore((s) => s.sessionId);
-  const responses = useChatStore((s) => s.responses);
+  const responses = useChatStore((s) => s.synthesizeResponses);
   const storedSynthesizerModel = useChatStore((s) => s.synthesizerModel);
+  const reconcileCompletedResponse = useChatStore((s) => s.reconcileCompletedResponse);
 
   // Sync source models when selectedModels change (e.g. switching to Synthesize mode)
   // Default: all currently selected models are source models
@@ -28,6 +29,15 @@ export default function SynthesizePanel() {
       setSynthesizer(storedSynthesizerModel);
     }
   }, [storedSynthesizerModel]);
+
+  useEffect(() => {
+    for (const [model, resp] of Object.entries(responses)) {
+      if (!resp?.done || !resp.content.trim()) continue;
+      if (resp.streamStatus !== 'stalled' && resp.streamStatus !== 'retrying') continue;
+      if (!['stop', 'STOP', 'end_turn'].includes(resp.stopReason ?? resp.debug?.stopReason ?? '')) continue;
+      reconcileCompletedResponse(model, 'synthesize');
+    }
+  }, [reconcileCompletedResponse, responses]);
 
   // Use selectedModels (session-active) instead of all MODELS
   const modelIds = selectedModels;
@@ -93,12 +103,12 @@ export default function SynthesizePanel() {
 
         {!sessionId && (
           <span className="text-xs text-yellow-500">
-            Send a prompt in Parallel mode first to generate responses
+            Start or reopen a shared session first
           </span>
         )}
         {sessionId && modelIds.length < 2 && (
           <span className="text-xs text-yellow-500">
-            Select at least 2 models in Parallel mode to synthesize
+            Select at least 2 models in this shared session to synthesize
           </span>
         )}
       </div>
@@ -131,8 +141,27 @@ export default function SynthesizePanel() {
             content={synthResp.content}
             done={synthResp.done}
             error={synthResp.error}
+            stopReason={synthResp.stopReason}
+            modeLabel={
+              synthResp.mode === 'observer_synthesize'
+                ? 'Observer Synthesize'
+                : 'Synthesize'
+            }
+            responseMode={synthResp.mode}
+            streamTarget="synthesize"
             sessionId={sessionId ?? undefined}
-            messageId={`synthesize-${synthesizer}-${Date.now()}`}
+            messageId={synthResp.messageId}
+            streamStatus={synthResp.streamStatus}
+            retryable={synthResp.retryable}
+            partialRetained={synthResp.partialRetained}
+            attempt={synthResp.attempt}
+            debug={synthResp.debug}
+            promptTokens={synthResp.promptTokens}
+            completionTokens={synthResp.completionTokens}
+            reasoningTokens={synthResp.reasoningTokens}
+            cachedTokens={synthResp.cachedTokens}
+            estimatedCostUsd={synthResp.estimatedCostUsd}
+            pricingSource={synthResp.pricingSource}
           />
         </div>
       )}

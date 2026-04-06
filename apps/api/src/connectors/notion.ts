@@ -282,7 +282,7 @@ export class NotionConnector extends BaseConnector {
       body: JSON.stringify(body),
     });
 
-    const pages = data.results ?? [];
+    const pages = (data.results ?? []).filter((page) => !page.archived && !page.in_trash);
     const db = getDb();
     const now = Date.now();
     const threads: ExternalThread[] = [];

@@ -25,7 +25,14 @@ function initSchema(db: Database.Database): void {
       timestamp INTEGER NOT NULL,
       token_count INTEGER,
       handoff_id TEXT,
-      handoff_from TEXT
+      handoff_from TEXT,
+      mode TEXT DEFAULT 'parallel',
+      prompt_tokens INTEGER,
+      completion_tokens INTEGER,
+      reasoning_tokens INTEGER,
+      cached_tokens INTEGER,
+      estimated_cost_usd REAL,
+      pricing_source TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_messages_session
@@ -110,9 +117,143 @@ function initSchema(db: Database.Database): void {
       title TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
-      preview TEXT
+      preview TEXT,
+      session_type TEXT NOT NULL DEFAULT 'topic',
+      parent_session_id TEXT,
+      action_type TEXT,
+      action_status TEXT,
+      action_title TEXT,
+      action_target TEXT,
+      context_snapshot TEXT,
+      result_summary TEXT,
+      interaction_mode TEXT,
+      active_model TEXT,
+      observer_models TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS observer_snapshots (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      active_model TEXT NOT NULL,
+      user_message_id TEXT NOT NULL,
+      active_message_id TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      risks TEXT,
+      disagreements TEXT,
+      suggested_follow_up TEXT,
+      status TEXT NOT NULL DEFAULT 'ready',
+      error TEXT,
+      captured_at INTEGER NOT NULL,
+      UNIQUE(session_id, model)
+    );
+    CREATE INDEX IF NOT EXISTS idx_observer_snapshots_session
+      ON observer_snapshots(session_id, captured_at DESC);
+
+    CREATE TABLE IF NOT EXISTS rich_preview_artifacts (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      message_id TEXT NOT NULL UNIQUE,
+      preview_kind TEXT NOT NULL,
+      selected_text TEXT NOT NULL,
+      selection_start INTEGER,
+      selection_end INTEGER,
+      source TEXT NOT NULL DEFAULT 'manual',
+      extraction_source TEXT,
+      has_leading_text INTEGER NOT NULL DEFAULT 0,
+      has_trailing_text INTEGER NOT NULL DEFAULT 0,
+      starts_with_tag TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_rich_preview_artifacts_session
+      ON rich_preview_artifacts(session_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS wiki_lint_runs (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      model TEXT,
+      finding_count INTEGER NOT NULL DEFAULT 0,
+      findings_json TEXT,
+      article_candidates_json TEXT,
+      error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_wiki_lint_runs_created
+      ON wiki_lint_runs(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS wiki_compile_plans (
+      id TEXT PRIMARY KEY,
+      source_id TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      source_title TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'planned',
+      model TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      applied_at INTEGER,
+      source_summary TEXT NOT NULL DEFAULT '',
+      detected_artifacts_json TEXT NOT NULL DEFAULT '[]',
+      items_json TEXT NOT NULL DEFAULT '[]',
+      warnings_json TEXT NOT NULL DEFAULT '[]',
+      skipped_items_json TEXT NOT NULL DEFAULT '[]',
+      errors_json TEXT NOT NULL DEFAULT '[]'
+    );
+    CREATE INDEX IF NOT EXISTS idx_wiki_compile_plans_source
+      ON wiki_compile_plans(source_id, source_type, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS wiki_backfill_jobs (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      started_at INTEGER,
+      completed_at INTEGER,
+      vault_path TEXT NOT NULL,
+      model TEXT,
+      batch_size INTEGER NOT NULL DEFAULT 10,
+      current_batch_size INTEGER NOT NULL DEFAULT 10,
+      total_items INTEGER NOT NULL DEFAULT 0,
+      processed_items INTEGER NOT NULL DEFAULT 0,
+      compiled_count INTEGER NOT NULL DEFAULT 0,
+      archived_count INTEGER NOT NULL DEFAULT 0,
+      skipped_count INTEGER NOT NULL DEFAULT 0,
+      failed_count INTEGER NOT NULL DEFAULT 0,
+      next_batch_number INTEGER NOT NULL DEFAULT 1,
+      last_lint_run_id TEXT,
+      last_lint_finding_count INTEGER,
+      tuning_notes_json TEXT NOT NULL DEFAULT '[]',
+      current_conversation_title TEXT,
+      error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_wiki_backfill_jobs_created
+      ON wiki_backfill_jobs(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS wiki_backfill_job_items (
+      id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      project_name TEXT,
+      age_bucket TEXT NOT NULL,
+      score REAL NOT NULL DEFAULT 0,
+      recommended_action TEXT NOT NULL,
+      selected_action TEXT NOT NULL,
+      reasons_json TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending',
+      batch_number INTEGER,
+      started_at INTEGER,
+      completed_at INTEGER,
+      file_path TEXT,
+      compile_plan_id TEXT,
+      applied_item_count INTEGER,
+      error TEXT,
+      FOREIGN KEY (job_id) REFERENCES wiki_backfill_jobs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_wiki_backfill_job_items_job
+      ON wiki_backfill_job_items(job_id, status, id);
 
     CREATE TABLE IF NOT EXISTS session_links (
       id TEXT PRIMARY KEY,
@@ -133,6 +274,389 @@ function initSchema(db: Database.Database): void {
       updated_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_decisions_active ON decisions(active, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS memory_items (
+      id TEXT PRIMARY KEY,
+      scope_type TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      confidence REAL NOT NULL DEFAULT 0.5,
+      valid_at INTEGER NOT NULL,
+      observed_at INTEGER NOT NULL,
+      last_confirmed_at INTEGER,
+      expires_at INTEGER,
+      source_kind TEXT NOT NULL DEFAULT 'assistant_extracted',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_items_type_status
+      ON memory_items(memory_type, status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memory_items_scope
+      ON memory_items(scope_type, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS memory_attributes (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (memory_item_id) REFERENCES memory_items(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_attributes_item
+      ON memory_attributes(memory_item_id);
+
+    CREATE TABLE IF NOT EXISTS memory_entity_links (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      entity_id TEXT,
+      entity_name TEXT NOT NULL,
+      link_role TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (memory_item_id) REFERENCES memory_items(id) ON DELETE CASCADE,
+      FOREIGN KEY (entity_id) REFERENCES knowledge_entities(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_entity_links_item
+      ON memory_entity_links(memory_item_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_entity_links_entity
+      ON memory_entity_links(entity_id);
+
+    CREATE TABLE IF NOT EXISTS memory_edges (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      source_entity_id TEXT,
+      source_entity_name TEXT NOT NULL,
+      target_entity_id TEXT,
+      target_entity_name TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (memory_item_id) REFERENCES memory_items(id) ON DELETE CASCADE,
+      FOREIGN KEY (source_entity_id) REFERENCES knowledge_entities(id),
+      FOREIGN KEY (target_entity_id) REFERENCES knowledge_entities(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_edges_item
+      ON memory_edges(memory_item_id);
+
+    CREATE TABLE IF NOT EXISTS memory_events (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      timeline_order INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (memory_item_id) REFERENCES memory_items(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_events_item
+      ON memory_events(memory_item_id, started_at DESC);
+
+    CREATE TABLE IF NOT EXISTS llm_usage_events (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      message_id TEXT,
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      mode TEXT NOT NULL,
+      request_id TEXT,
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER NOT NULL,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      estimated_cost_usd REAL NOT NULL DEFAULT 0,
+      pricing_version TEXT NOT NULL DEFAULT 'static-v1',
+      pricing_source TEXT NOT NULL DEFAULT 'static_registry_estimate',
+      workspace_scope TEXT,
+      status TEXT NOT NULL DEFAULT 'completed',
+      metadata TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_llm_usage_events_session
+      ON llm_usage_events(session_id, completed_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_llm_usage_events_provider_month
+      ON llm_usage_events(provider, completed_at DESC);
+
+    CREATE TABLE IF NOT EXISTS llm_cost_rollups (
+      id TEXT PRIMARY KEY,
+      bucket_type TEXT NOT NULL,
+      bucket_key TEXT NOT NULL,
+      provider TEXT,
+      model TEXT,
+      mode TEXT,
+      estimated_cost_usd REAL NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_llm_cost_rollups_bucket
+      ON llm_cost_rollups(bucket_type, bucket_key, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS provider_cost_sync_runs (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      month TEXT NOT NULL,
+      status TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      message TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_provider_cost_sync_runs_provider_month
+      ON provider_cost_sync_runs(provider, month, started_at DESC);
+
+    CREATE TABLE IF NOT EXISTS provider_cost_records (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      month TEXT NOT NULL,
+      line_item TEXT NOT NULL,
+      amount_usd REAL NOT NULL DEFAULT 0,
+      currency TEXT NOT NULL DEFAULT 'USD',
+      display_status TEXT NOT NULL DEFAULT 'reconciled',
+      synced_at INTEGER NOT NULL,
+      metadata TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_provider_cost_records_provider_month
+      ON provider_cost_records(provider, month, synced_at DESC);
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS compiler_runs (
+      id TEXT PRIMARY KEY,
+      source_id TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      source_title TEXT NOT NULL,
+      destination_type TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      model TEXT,
+      created_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      graph_updates_count INTEGER NOT NULL DEFAULT 0,
+      memory_candidates_count INTEGER NOT NULL DEFAULT 0,
+      trigger_candidates_count INTEGER NOT NULL DEFAULT 0,
+      concept_count INTEGER NOT NULL DEFAULT 0,
+      related_note_count INTEGER NOT NULL DEFAULT 0,
+      backlink_suggestion_count INTEGER NOT NULL DEFAULT 0,
+      article_candidate_count INTEGER NOT NULL DEFAULT 0,
+      summary_json TEXT,
+      artifacts_json TEXT,
+      error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_compiler_runs_source
+      ON compiler_runs(source_id, source_type, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS memory_sources (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      session_id TEXT,
+      message_id TEXT,
+      conversation_id TEXT,
+      provenance_id TEXT,
+      excerpt TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (memory_item_id) REFERENCES memory_items(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_sources_item
+      ON memory_sources(memory_item_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_sources_session
+      ON memory_sources(session_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS memory_candidates (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      message_id TEXT,
+      scope_type TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      source_kind TEXT NOT NULL DEFAULT 'assistant_extracted',
+      status TEXT NOT NULL DEFAULT 'pending',
+      payload TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_candidates_status
+      ON memory_candidates(status, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS memory_embeddings (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      memory_source_id TEXT,
+      embedding BLOB NOT NULL,
+      model TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (memory_item_id) REFERENCES memory_items(id) ON DELETE CASCADE,
+      FOREIGN KEY (memory_source_id) REFERENCES memory_sources(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_embeddings_item
+      ON memory_embeddings(memory_item_id);
+
+    CREATE TABLE IF NOT EXISTS working_memory_items (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      memory_type TEXT NOT NULL DEFAULT 'working',
+      status TEXT NOT NULL DEFAULT 'active',
+      confidence REAL NOT NULL DEFAULT 0.5,
+      source_message_id TEXT,
+      observed_at INTEGER NOT NULL,
+      expires_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_working_memory_session
+      ON working_memory_items(session_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS memory_extraction_runs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      trigger TEXT NOT NULL,
+      source_message_ids TEXT NOT NULL,
+      added_count INTEGER NOT NULL DEFAULT 0,
+      duplicate_count INTEGER NOT NULL DEFAULT 0,
+      accepted_count INTEGER NOT NULL DEFAULT 0,
+      rejected_count INTEGER NOT NULL DEFAULT 0,
+      notes TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_extraction_runs_session
+      ON memory_extraction_runs(session_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS memory_extraction_run_items (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      candidate_id TEXT,
+      memory_item_id TEXT,
+      title TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      reason TEXT,
+      metadata_json TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (run_id) REFERENCES memory_extraction_runs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_extraction_run_items_run
+      ON memory_extraction_run_items(run_id, created_at ASC);
+
+    CREATE TABLE IF NOT EXISTS relationship_mentions (
+      id TEXT PRIMARY KEY,
+      workspace_key TEXT NOT NULL,
+      source_entity_name TEXT NOT NULL,
+      target_entity_name TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      routing_decision TEXT NOT NULL,
+      promotion_reason TEXT,
+      mention_count INTEGER NOT NULL DEFAULT 1,
+      last_seen_at INTEGER NOT NULL,
+      source_session_id TEXT,
+      source_message_id TEXT,
+      summary TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_relationship_mentions_unique
+      ON relationship_mentions(workspace_key, source_entity_name, target_entity_name, relation_type);
+    CREATE INDEX IF NOT EXISTS idx_relationship_mentions_routing
+      ON relationship_mentions(routing_decision, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS memory_usage_runs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      model TEXT NOT NULL,
+      mode TEXT,
+      prompt_preview TEXT NOT NULL,
+      total_retrieved INTEGER NOT NULL DEFAULT 0,
+      total_injected INTEGER NOT NULL DEFAULT 0,
+      total_omitted INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_usage_runs_session
+      ON memory_usage_runs(session_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS memory_usage_run_items (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      memory_item_id TEXT,
+      title TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      action TEXT NOT NULL,
+      reason TEXT,
+      summary TEXT,
+      confidence REAL,
+      source_session_id TEXT,
+      source_message_id TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (run_id) REFERENCES memory_usage_runs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_usage_run_items_run
+      ON memory_usage_run_items(run_id, created_at ASC);
+
+    CREATE TABLE IF NOT EXISTS trigger_candidates (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      source_memory_item_id TEXT,
+      source_candidate_id TEXT,
+      trigger_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      confidence REAL NOT NULL DEFAULT 0.5,
+      trigger_at INTEGER,
+      delivery_channel TEXT NOT NULL DEFAULT 'web',
+      action_json TEXT NOT NULL,
+      metadata_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trigger_candidates_status
+      ON trigger_candidates(status, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS trigger_rules (
+      id TEXT PRIMARY KEY,
+      trigger_candidate_id TEXT,
+      trigger_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      trigger_at INTEGER,
+      delivery_channel TEXT NOT NULL DEFAULT 'web',
+      action_json TEXT NOT NULL,
+      metadata_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trigger_rules_status
+      ON trigger_rules(status, trigger_at);
+
+    CREATE TABLE IF NOT EXISTS trigger_runs (
+      id TEXT PRIMARY KEY,
+      trigger_candidate_id TEXT,
+      trigger_rule_id TEXT,
+      status TEXT NOT NULL,
+      note TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trigger_runs_created
+      ON trigger_runs(created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS trigger_notifications (
+      id TEXT PRIMARY KEY,
+      trigger_run_id TEXT,
+      channel TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      deep_link TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trigger_notifications_created
+      ON trigger_notifications(created_at DESC);
 
     -- Phase 6: Communication Tools Integration
 
@@ -254,6 +778,11 @@ function initSchema(db: Database.Database): void {
       source_platform TEXT NOT NULL,
       original_id TEXT,
       title TEXT NOT NULL,
+      source_title TEXT,
+      title_source TEXT NOT NULL DEFAULT 'source',
+      title_locked INTEGER NOT NULL DEFAULT 0,
+      title_generated_at TEXT,
+      title_last_message_count INTEGER,
       created_at TEXT NOT NULL,
       updated_at TEXT,
       message_count INTEGER DEFAULT 0,
@@ -280,6 +809,50 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_imported_conversations_batch ON imported_conversations(import_batch_id);
     CREATE INDEX IF NOT EXISTS idx_imported_conversations_created ON imported_conversations(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_imported_messages_conversation ON imported_messages(conversation_id, timestamp);
+
+    CREATE TABLE IF NOT EXISTS import_sync_state (
+      conversation_id TEXT PRIMARY KEY,
+      source_platform TEXT NOT NULL,
+      original_id TEXT NOT NULL,
+      source_kind TEXT NOT NULL,
+      last_synced_at TEXT NOT NULL,
+      source_updated_at TEXT,
+      project_name TEXT,
+      workspace_id TEXT,
+      workspace_name TEXT,
+      account_id TEXT,
+      metadata TEXT,
+      FOREIGN KEY (conversation_id) REFERENCES imported_conversations(id),
+      UNIQUE (source_platform, original_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_import_sync_state_source
+      ON import_sync_state(source_platform, original_id);
+    CREATE INDEX IF NOT EXISTS idx_import_sync_state_last_synced
+      ON import_sync_state(last_synced_at DESC);
+
+    CREATE TABLE IF NOT EXISTS import_sync_runs (
+      id TEXT PRIMARY KEY,
+      source_platform TEXT NOT NULL,
+      source_kind TEXT NOT NULL,
+      project_name TEXT,
+      status TEXT NOT NULL,
+      requested_conversations INTEGER NOT NULL DEFAULT 0,
+      processed_conversations INTEGER NOT NULL DEFAULT 0,
+      imported_conversations INTEGER NOT NULL DEFAULT 0,
+      overwritten_conversations INTEGER NOT NULL DEFAULT 0,
+      skipped_conversations INTEGER NOT NULL DEFAULT 0,
+      failed_conversations INTEGER NOT NULL DEFAULT 0,
+      total_messages INTEGER NOT NULL DEFAULT 0,
+      batch_count INTEGER NOT NULL DEFAULT 1,
+      completed_batch_count INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      metadata TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_import_sync_runs_updated
+      ON import_sync_runs(updated_at DESC);
 
     -- Phase 7b: FTS5 full-text search indexes
 
@@ -392,6 +965,17 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_session_outlines_session
       ON session_outlines(session_id, source_type);
 
+    CREATE TABLE IF NOT EXISTS session_bootstraps (
+      session_id TEXT PRIMARY KEY,
+      bootstrap_type TEXT NOT NULL,
+      source_count INTEGER NOT NULL DEFAULT 0,
+      payload TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_bootstraps_created
+      ON session_bootstraps(created_at DESC);
+
     -- Phase 7d: Content Provenance Tracking
     CREATE TABLE IF NOT EXISTS content_provenance (
       id TEXT PRIMARY KEY,
@@ -443,6 +1027,28 @@ function initSchema(db: Database.Database): void {
       attached_by TEXT NOT NULL DEFAULT 'user'
     );
     CREATE INDEX IF NOT EXISTS idx_context_sources_session ON context_sources(session_id);
+
+    CREATE TABLE IF NOT EXISTS web_pages (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      root_url TEXT NOT NULL,
+      url TEXT NOT NULL,
+      normalized_url TEXT NOT NULL,
+      title TEXT,
+      host TEXT NOT NULL,
+      depth INTEGER NOT NULL DEFAULT 0,
+      parent_web_page_id TEXT,
+      anchor_text TEXT,
+      content_text TEXT NOT NULL,
+      content_hash TEXT,
+      attached_at INTEGER NOT NULL,
+      discovered_at INTEGER NOT NULL,
+      metadata TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_web_pages_session ON web_pages(session_id);
+    CREATE INDEX IF NOT EXISTS idx_web_pages_root_url ON web_pages(root_url);
+    CREATE INDEX IF NOT EXISTS idx_web_pages_normalized_url ON web_pages(normalized_url);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_web_pages_session_normalized_url ON web_pages(session_id, normalized_url);
 
     -- File Upload + Document Analysis
     CREATE TABLE IF NOT EXISTS uploaded_files (
@@ -515,9 +1121,13 @@ function initSchema(db: Database.Database): void {
 
   // Migrate existing tables if columns are missing
   migrateMessages(db);
+  migrateRichPreviewArtifacts(db);
 
   // Backfill sessions table from existing messages
   migrateSessionsFromMessages(db);
+
+  // Prism topic/action session migration
+  migratePrismSessions(db);
 
   // Multi-account connector migration
   migrateMultiAccount(db);
@@ -530,6 +1140,13 @@ function initSchema(db: Database.Database): void {
 
   // Uploaded files metadata migration
   migrateUploadedFilesMetadata(db);
+
+  // Imported conversation title metadata migration
+  migrateImportedConversationTitles(db);
+
+  // Observer mode migration
+  migrateObserverMode(db);
+  migrateStructuredMemory(db);
 }
 
 /**
@@ -636,6 +1253,46 @@ function migrateMessages(db: Database.Database): void {
   if (!colNames.has('mode')) {
     db.exec("ALTER TABLE messages ADD COLUMN mode TEXT DEFAULT 'parallel'");
   }
+  if (!colNames.has('prompt_tokens')) {
+    db.exec('ALTER TABLE messages ADD COLUMN prompt_tokens INTEGER');
+  }
+  if (!colNames.has('completion_tokens')) {
+    db.exec('ALTER TABLE messages ADD COLUMN completion_tokens INTEGER');
+  }
+  if (!colNames.has('reasoning_tokens')) {
+    db.exec('ALTER TABLE messages ADD COLUMN reasoning_tokens INTEGER');
+  }
+  if (!colNames.has('cached_tokens')) {
+    db.exec('ALTER TABLE messages ADD COLUMN cached_tokens INTEGER');
+  }
+  if (!colNames.has('estimated_cost_usd')) {
+    db.exec('ALTER TABLE messages ADD COLUMN estimated_cost_usd REAL');
+  }
+  if (!colNames.has('pricing_source')) {
+    db.exec("ALTER TABLE messages ADD COLUMN pricing_source TEXT");
+  }
+}
+
+function migrateRichPreviewArtifacts(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS rich_preview_artifacts (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      message_id TEXT NOT NULL UNIQUE,
+      preview_kind TEXT NOT NULL,
+      selected_text TEXT NOT NULL,
+      selection_start INTEGER,
+      selection_end INTEGER,
+      source TEXT NOT NULL DEFAULT 'manual',
+      extraction_source TEXT,
+      has_leading_text INTEGER NOT NULL DEFAULT 0,
+      has_trailing_text INTEGER NOT NULL DEFAULT 0,
+      starts_with_tag TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_rich_preview_artifacts_session
+      ON rich_preview_artifacts(session_id, created_at DESC)
+  `);
 }
 
 function getColumnNames(db: Database.Database, table: string): Set<string> {
@@ -864,6 +1521,41 @@ function migrateUploadedFilesMetadata(db: Database.Database): void {
   }
 }
 
+function migrateImportedConversationTitles(db: Database.Database): void {
+  const cols = getColumnNames(db, 'imported_conversations');
+  if (!cols.has('source_title')) {
+    db.exec('ALTER TABLE imported_conversations ADD COLUMN source_title TEXT');
+  }
+  if (!cols.has('title_source')) {
+    db.exec("ALTER TABLE imported_conversations ADD COLUMN title_source TEXT NOT NULL DEFAULT 'source'");
+  }
+  if (!cols.has('title_locked')) {
+    db.exec('ALTER TABLE imported_conversations ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!cols.has('title_generated_at')) {
+    db.exec('ALTER TABLE imported_conversations ADD COLUMN title_generated_at TEXT');
+  }
+  if (!cols.has('title_last_message_count')) {
+    db.exec('ALTER TABLE imported_conversations ADD COLUMN title_last_message_count INTEGER');
+  }
+
+  db.exec(`
+    UPDATE imported_conversations
+    SET source_title = COALESCE(source_title, title)
+    WHERE source_title IS NULL OR TRIM(source_title) = '';
+  `);
+  db.exec(`
+    UPDATE imported_conversations
+    SET title_source = COALESCE(NULLIF(title_source, ''), 'source')
+    WHERE title_source IS NULL OR TRIM(title_source) = '';
+  `);
+  db.exec(`
+    UPDATE imported_conversations
+    SET title_locked = COALESCE(title_locked, 0)
+    WHERE title_locked IS NULL;
+  `);
+}
+
 /**
  * If sessions table is empty but messages has data, backfill session rows
  * derived from existing messages.
@@ -901,4 +1593,336 @@ function migrateSessionsFromMessages(db: Database.Database): void {
     }
   });
   txn();
+}
+
+function migratePrismSessions(db: Database.Database): void {
+  const cols = getColumnNames(db, 'sessions');
+
+  if (!cols.has('session_type')) {
+    db.exec("ALTER TABLE sessions ADD COLUMN session_type TEXT NOT NULL DEFAULT 'topic'");
+  }
+  if (!cols.has('parent_session_id')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN parent_session_id TEXT');
+  }
+  if (!cols.has('action_type')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN action_type TEXT');
+  }
+  if (!cols.has('action_status')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN action_status TEXT');
+  }
+  if (!cols.has('action_title')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN action_title TEXT');
+  }
+  if (!cols.has('action_target')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN action_target TEXT');
+  }
+  if (!cols.has('context_snapshot')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN context_snapshot TEXT');
+  }
+  if (!cols.has('result_summary')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN result_summary TEXT');
+  }
+  if (!cols.has('interaction_mode')) {
+    db.exec("ALTER TABLE sessions ADD COLUMN interaction_mode TEXT");
+  }
+  if (!cols.has('active_model')) {
+    db.exec("ALTER TABLE sessions ADD COLUMN active_model TEXT");
+  }
+  if (!cols.has('observer_models')) {
+    db.exec("ALTER TABLE sessions ADD COLUMN observer_models TEXT");
+  }
+
+  db.exec("UPDATE sessions SET session_type = 'topic' WHERE session_type IS NULL OR session_type = ''");
+  db.exec("UPDATE sessions SET action_status = 'draft' WHERE session_type = 'action' AND (action_status IS NULL OR action_status = '')");
+}
+
+function migrateObserverMode(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS observer_snapshots (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      active_model TEXT NOT NULL,
+      user_message_id TEXT NOT NULL,
+      active_message_id TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      risks TEXT,
+      disagreements TEXT,
+      suggested_follow_up TEXT,
+      status TEXT NOT NULL DEFAULT 'ready',
+      error TEXT,
+      captured_at INTEGER NOT NULL,
+      UNIQUE(session_id, model)
+    )
+  `);
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_observer_snapshots_session
+    ON observer_snapshots(session_id, captured_at DESC)
+  `);
+}
+
+function migrateStructuredMemory(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_items (
+      id TEXT PRIMARY KEY,
+      scope_type TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      confidence REAL NOT NULL DEFAULT 0.5,
+      valid_at INTEGER NOT NULL,
+      observed_at INTEGER NOT NULL,
+      last_confirmed_at INTEGER,
+      expires_at INTEGER,
+      source_kind TEXT NOT NULL DEFAULT 'assistant_extracted',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS memory_attributes (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS memory_entity_links (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      entity_id TEXT,
+      entity_name TEXT NOT NULL,
+      link_role TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS memory_edges (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      source_entity_id TEXT,
+      source_entity_name TEXT NOT NULL,
+      target_entity_id TEXT,
+      target_entity_name TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS memory_events (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      timeline_order INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS memory_sources (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      session_id TEXT,
+      message_id TEXT,
+      conversation_id TEXT,
+      provenance_id TEXT,
+      excerpt TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS memory_candidates (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      message_id TEXT,
+      scope_type TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      source_kind TEXT NOT NULL DEFAULT 'assistant_extracted',
+      status TEXT NOT NULL DEFAULT 'pending',
+      payload TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS memory_embeddings (
+      id TEXT PRIMARY KEY,
+      memory_item_id TEXT NOT NULL,
+      memory_source_id TEXT,
+      embedding BLOB NOT NULL,
+      model TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_items_type_status
+      ON memory_items(memory_type, status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memory_items_scope
+      ON memory_items(scope_type, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memory_attributes_item
+      ON memory_attributes(memory_item_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_entity_links_item
+      ON memory_entity_links(memory_item_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_entity_links_entity
+      ON memory_entity_links(entity_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_edges_item
+      ON memory_edges(memory_item_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_events_item
+      ON memory_events(memory_item_id, started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memory_sources_item
+      ON memory_sources(memory_item_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_sources_session
+      ON memory_sources(session_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memory_candidates_status
+      ON memory_candidates(status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_memory_embeddings_item
+      ON memory_embeddings(memory_item_id);
+    CREATE TABLE IF NOT EXISTS working_memory_items (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      memory_type TEXT NOT NULL DEFAULT 'working',
+      status TEXT NOT NULL DEFAULT 'active',
+      confidence REAL NOT NULL DEFAULT 0.5,
+      source_message_id TEXT,
+      observed_at INTEGER NOT NULL,
+      expires_at INTEGER,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_working_memory_session
+      ON working_memory_items(session_id, updated_at DESC);
+    CREATE TABLE IF NOT EXISTS memory_extraction_runs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      trigger TEXT NOT NULL,
+      source_message_ids TEXT NOT NULL,
+      added_count INTEGER NOT NULL DEFAULT 0,
+      duplicate_count INTEGER NOT NULL DEFAULT 0,
+      accepted_count INTEGER NOT NULL DEFAULT 0,
+      rejected_count INTEGER NOT NULL DEFAULT 0,
+      notes TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_extraction_runs_session
+      ON memory_extraction_runs(session_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS memory_extraction_run_items (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      candidate_id TEXT,
+      memory_item_id TEXT,
+      title TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      reason TEXT,
+      metadata_json TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_extraction_run_items_run
+      ON memory_extraction_run_items(run_id, created_at ASC);
+    CREATE TABLE IF NOT EXISTS relationship_mentions (
+      id TEXT PRIMARY KEY,
+      workspace_key TEXT NOT NULL,
+      source_entity_name TEXT NOT NULL,
+      target_entity_name TEXT NOT NULL,
+      relation_type TEXT NOT NULL,
+      routing_decision TEXT NOT NULL,
+      promotion_reason TEXT,
+      mention_count INTEGER NOT NULL DEFAULT 1,
+      last_seen_at INTEGER NOT NULL,
+      source_session_id TEXT,
+      source_message_id TEXT,
+      summary TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_relationship_mentions_unique
+      ON relationship_mentions(workspace_key, source_entity_name, target_entity_name, relation_type);
+    CREATE INDEX IF NOT EXISTS idx_relationship_mentions_routing
+      ON relationship_mentions(routing_decision, updated_at DESC);
+    CREATE TABLE IF NOT EXISTS memory_usage_runs (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      model TEXT NOT NULL,
+      mode TEXT,
+      prompt_preview TEXT NOT NULL,
+      total_retrieved INTEGER NOT NULL DEFAULT 0,
+      total_injected INTEGER NOT NULL DEFAULT 0,
+      total_omitted INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_usage_runs_session
+      ON memory_usage_runs(session_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS memory_usage_run_items (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      memory_item_id TEXT,
+      title TEXT NOT NULL,
+      memory_type TEXT NOT NULL,
+      action TEXT NOT NULL,
+      reason TEXT,
+      summary TEXT,
+      confidence REAL,
+      source_session_id TEXT,
+      source_message_id TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_usage_run_items_run
+      ON memory_usage_run_items(run_id, created_at ASC);
+    CREATE TABLE IF NOT EXISTS trigger_candidates (
+      id TEXT PRIMARY KEY,
+      session_id TEXT,
+      source_memory_item_id TEXT,
+      source_candidate_id TEXT,
+      trigger_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      confidence REAL NOT NULL DEFAULT 0.5,
+      trigger_at INTEGER,
+      delivery_channel TEXT NOT NULL DEFAULT 'web',
+      action_json TEXT NOT NULL,
+      metadata_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trigger_candidates_status
+      ON trigger_candidates(status, created_at DESC);
+    CREATE TABLE IF NOT EXISTS trigger_rules (
+      id TEXT PRIMARY KEY,
+      trigger_candidate_id TEXT,
+      trigger_type TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      trigger_at INTEGER,
+      delivery_channel TEXT NOT NULL DEFAULT 'web',
+      action_json TEXT NOT NULL,
+      metadata_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trigger_rules_status
+      ON trigger_rules(status, trigger_at);
+    CREATE TABLE IF NOT EXISTS trigger_runs (
+      id TEXT PRIMARY KEY,
+      trigger_candidate_id TEXT,
+      trigger_rule_id TEXT,
+      status TEXT NOT NULL,
+      note TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trigger_runs_created
+      ON trigger_runs(created_at DESC);
+    CREATE TABLE IF NOT EXISTS trigger_notifications (
+      id TEXT PRIMARY KEY,
+      trigger_run_id TEXT,
+      channel TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      deep_link TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_trigger_notifications_created
+      ON trigger_notifications(created_at DESC);
+  `);
+
+  const extractionRunItemCols = getColumnNames(db, 'memory_extraction_run_items');
+  if (!extractionRunItemCols.has('metadata_json')) {
+    db.exec('ALTER TABLE memory_extraction_run_items ADD COLUMN metadata_json TEXT');
+  }
 }

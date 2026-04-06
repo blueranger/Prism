@@ -2,23 +2,36 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useChatStore } from '@/stores/chat-store';
-import { streamPrompt, classifyPrompt, createDraft, fetchEntities, fetchEntityDetail, fetchFile, createSession, uploadFile } from '@/lib/api';
+import { streamObserver, streamPrompt, classifyPrompt, createDraft, fetchEntities, fetchEntityDetail, fetchFile, createSession, uploadFile, fetchUrlPreviews, fetchWebContextPreview, attachWebPages, deleteWebPageAttachment, fetchSessionApi, fetchWebContext } from '@/lib/api';
 import { toast } from '@/stores/toast-store';
 import { extractKeywords } from '@/lib/keyword-extractor';
 import ContextualHintsPanel from '@/components/ContextualHintsPanel';
+import ContextMixPanel from '@/components/ContextMixPanel';
 import FileUploadButton from '@/components/FileUploadButton';
 import FileChip from '@/components/FileChip';
-import type { ClassificationResult, KnowledgeHintMatch, UploadedFile } from '@prism/shared';
+import UrlChip from '@/components/UrlChip';
+import UrlDetailModal from '@/components/UrlDetailModal';
+import type { ClassificationResult, KnowledgeHintMatch, UploadedFile, UrlPreview, WebPagePreviewResponse } from '@prism/shared';
+import { MODELS } from '@prism/shared';
+
+const URL_REGEX = /https?:\/\/[^\s)]+/gi;
 
 export default function PromptInput() {
   const [prompt, setPrompt] = useState('');
+  const [isComposing, setIsComposing] = useState(false);
   const [suggestion, setSuggestion] = useState<ClassificationResult | null>(null);
   const [dismissed, setDismissed] = useState(false);
   const [commDrafting, setCommDrafting] = useState(false);
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+  const [urlPreviews, setUrlPreviews] = useState<UrlPreview[]>([]);
+  const [urlPreviewLoading, setUrlPreviewLoading] = useState(false);
+  const [detailData, setDetailData] = useState<WebPagePreviewResponse | null>(null);
+  const [detailLoadingUrl, setDetailLoadingUrl] = useState<string | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hintsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const urlPreviewDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const mode = useChatStore((s) => s.mode);
   const isStreaming = useChatStore((s) => s.isStreaming);
@@ -26,7 +39,11 @@ export default function PromptInput() {
   const toggleModel = useChatStore((s) => s.toggleModel);
   const commSelectedThreadId = useChatStore((s) => s.commSelectedThreadId);
   const hintsEnabled = useChatStore((s) => s.knowledgeHintsEnabled);
+  const recommendationsEnabled = useChatStore((s) => s.modelRecommendationsEnabled);
   const sessionId = useChatStore((s) => s.sessionId);
+  const attachedWebPages = useChatStore((s) => s.attachedWebPages);
+  const setAttachedWebPages = useChatStore((s) => s.setAttachedWebPages);
+  const setCurrentSession = useChatStore((s) => s.setCurrentSession);
 
   const isCommMode = mode === 'communication';
 
@@ -126,10 +143,14 @@ export default function PromptInput() {
 
   // Debounced classification (only in parallel mode)
   useEffect(() => {
-    if (isCommMode) return;
-
     if (debounceRef.current) {
       clearTimeout(debounceRef.current);
+    }
+
+    if (isCommMode || !recommendationsEnabled) {
+      setSuggestion(null);
+      setDismissed(false);
+      return;
     }
 
     const trimmed = prompt.trim();
@@ -149,7 +170,7 @@ export default function PromptInput() {
         clearTimeout(debounceRef.current);
       }
     };
-  }, [prompt, isCommMode]);
+  }, [prompt, isCommMode, recommendationsEnabled]);
 
   // Debounced Knowledge Hints (Scenario 1)
   useEffect(() => {
@@ -251,6 +272,37 @@ export default function PromptInput() {
     setUploadedFiles([]);
   }, [sessionId]);
 
+  useEffect(() => {
+    if (urlPreviewDebounceRef.current) {
+      clearTimeout(urlPreviewDebounceRef.current);
+    }
+
+    const hasUrls = URL_REGEX.test(prompt);
+    URL_REGEX.lastIndex = 0;
+
+    if (!hasUrls) {
+      setUrlPreviews([]);
+      setUrlPreviewLoading(false);
+      return;
+    }
+
+    urlPreviewDebounceRef.current = setTimeout(async () => {
+      setUrlPreviewLoading(true);
+      try {
+        const previews = await fetchUrlPreviews(prompt);
+        setUrlPreviews(previews);
+      } finally {
+        setUrlPreviewLoading(false);
+      }
+    }, 500);
+
+    return () => {
+      if (urlPreviewDebounceRef.current) {
+        clearTimeout(urlPreviewDebounceRef.current);
+      }
+    };
+  }, [prompt]);
+
   // Poll for file analysis status updates
   useEffect(() => {
     const pending = uploadedFiles.filter((f) => f.status === 'pending' || f.status === 'processing');
@@ -293,6 +345,63 @@ export default function PromptInput() {
     setUploadedFiles((prev) => prev.filter((f) => f.id !== fileId));
   };
 
+  const ensureSessionForAttachment = useCallback(async () => {
+    let sid = useChatStore.getState().sessionId;
+    if (sid) return sid;
+
+    sid = await createSession();
+    if (!sid) {
+      toast.error('Failed to create session for web attachment.');
+      return null;
+    }
+
+    useChatStore.getState().setSessionId(sid);
+    setCurrentSession(await fetchSessionApi(sid));
+    return sid;
+  }, [setCurrentSession]);
+
+  const openUrlDetail = useCallback(async (url: string) => {
+    setDetailLoadingUrl(url);
+    try {
+      const detail = await fetchWebContextPreview(url);
+      if (!detail) {
+        toast.error('Failed to load URL details.');
+        return;
+      }
+      setDetailData(detail);
+    } finally {
+      setDetailLoadingUrl(null);
+    }
+  }, []);
+
+  const handleAttachPages = useCallback(async (rootUrl: string, selectedUrls: string[]) => {
+    const sid = await ensureSessionForAttachment();
+    if (!sid) return;
+    const pages = await attachWebPages(sid, rootUrl, selectedUrls);
+    if (pages.length === 0) {
+      toast.error('Failed to attach web pages.');
+      return;
+    }
+    setAttachedWebPages(await fetchWebContext(sid));
+    toast.success(`Attached ${pages.length} web page${pages.length === 1 ? '' : 's'}.`);
+  }, [ensureSessionForAttachment, setAttachedWebPages]);
+
+  const handleRemoveWebPage = useCallback(async (id: string) => {
+    const ok = await deleteWebPageAttachment(id);
+    if (!ok) {
+      toast.error('Failed to remove web page.');
+      return;
+    }
+    setAttachedWebPages(attachedWebPages.filter((page) => page.id !== id));
+  }, [attachedWebPages, setAttachedWebPages]);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = '0px';
+    el.style.height = `${Math.min(el.scrollHeight, 192)}px`;
+  }, [prompt]);
+
   // Clear hints on submit
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -304,6 +413,7 @@ export default function PromptInput() {
       if (!commSelectedThreadId || commDrafting) return;
       setCommDrafting(true);
       setPrompt('');
+      setUrlPreviews([]);
       const { draft } = await createDraft(commSelectedThreadId, { instruction: trimmed });
       if (draft) {
         // Store the draft so ThreadDetail can pick it up
@@ -311,29 +421,42 @@ export default function PromptInput() {
       }
       setCommDrafting(false);
     } else {
-      // Parallel mode: send to selected models
       if (isStreaming || selectedModels.length === 0) return;
       setPrompt('');
       setSuggestion(null);
       setDismissed(false);
+      setUrlPreviews([]);
       useChatStore.getState().clearKnowledgeHints();
-      streamPrompt(trimmed);
+      if (mode === 'observer') {
+        streamObserver(trimmed);
+      } else {
+        streamPrompt(trimmed);
+      }
     }
   };
 
+  const recommendedProvider = suggestion ? MODELS[suggestion.recommendedModel]?.provider : undefined;
+  const providerSelectedModel = recommendationProviderMatch(selectedModels, recommendedProvider);
+  const effectiveSuggestedModel = providerSelectedModel ?? suggestion?.recommendedModel ?? null;
+  const effectiveSuggestedDisplayName =
+    effectiveSuggestedModel && MODELS[effectiveSuggestedModel]?.displayName
+      ? MODELS[effectiveSuggestedModel].displayName
+      : suggestion?.displayName ?? null;
+  const isSuggestedModelSelected = effectiveSuggestedModel ? selectedModels.includes(effectiveSuggestedModel) : false;
+
   const handleAccept = () => {
-    if (suggestion) {
-      toggleModel(suggestion.recommendedModel);
+    if (effectiveSuggestedModel && !selectedModels.includes(effectiveSuggestedModel)) {
+      toggleModel(effectiveSuggestedModel);
     }
     setDismissed(true);
   };
 
   const showChip =
     !isCommMode &&
+    recommendationsEnabled &&
     suggestion !== null &&
     !dismissed &&
-    !isStreaming &&
-    !selectedModels.includes(suggestion.recommendedModel);
+    !isStreaming;
 
   const isDisabled = isCommMode
     ? !prompt.trim() || !commSelectedThreadId || commDrafting
@@ -350,6 +473,28 @@ export default function PromptInput() {
   const placeholder = isCommMode
     ? 'Type an instruction for the reply (e.g. "politely decline this meeting")...'
     : 'Type your prompt...';
+  const attachedNormalizedUrls = new Set(attachedWebPages.map((page) => page.normalizedUrl));
+  const visibleDetectedUrls = urlPreviews.filter((preview) => {
+    const normalized = preview.url.replace(/#.*$/, '').replace(/\/+$/, '');
+    return !attachedWebPages.some((page) =>
+      page.url === preview.url ||
+      page.normalizedUrl === normalized ||
+      page.normalizedUrl === `${normalized}/`
+    );
+  });
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const nativeIsComposing = (e.nativeEvent as KeyboardEvent).isComposing;
+    if (isComposing || nativeIsComposing || e.keyCode === 229) {
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (!isDisabled) {
+        void handleSubmit(e);
+      }
+    }
+  };
 
   return (
     <div
@@ -376,16 +521,17 @@ export default function PromptInput() {
       {showChip && suggestion && (
         <div className="flex items-center gap-3 bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm">
           <span className="text-indigo-400 font-medium whitespace-nowrap">
-            {suggestion.displayName}
+            {effectiveSuggestedDisplayName}
           </span>
           <span className="text-gray-400 truncate">{suggestion.reason}</span>
           <div className="flex items-center gap-2 ml-auto shrink-0">
             <button
               type="button"
               onClick={handleAccept}
-              className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 py-1 rounded font-medium transition-colors"
+              disabled={isSuggestedModelSelected}
+              className="bg-indigo-600 hover:bg-indigo-500 text-white text-xs px-3 py-1 rounded font-medium transition-colors disabled:cursor-default disabled:opacity-60 disabled:hover:bg-indigo-600"
             >
-              + Add
+              {isSuggestedModelSelected ? 'Selected' : '+ Add'}
             </button>
             <button
               type="button"
@@ -397,6 +543,8 @@ export default function PromptInput() {
           </div>
         </div>
       )}
+
+      {!isCommMode && <ContextMixPanel />}
 
       {/* Knowledge Hints Panel (Scenario 1) */}
       {!isCommMode && hintsEnabled && <ContextualHintsPanel />}
@@ -417,20 +565,71 @@ export default function PromptInput() {
         </div>
       )}
 
-      <form onSubmit={handleSubmit} className="flex gap-2">
+      {attachedWebPages.length > 0 && (
+        <div className="px-1 py-1.5">
+          <div className="mb-1.5 flex items-center gap-2">
+            <span className="text-[10px] font-medium uppercase tracking-wider text-gray-500">
+              Attached Web Pages ({attachedWebPages.length})
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {attachedWebPages.map((page) => (
+              <UrlChip
+                key={page.id}
+                preview={{ url: page.url, title: page.title, content: page.contentText }}
+                statusLabel="Attached"
+                onOpen={() => openUrlDetail(page.url)}
+                onRemove={() => handleRemoveWebPage(page.id)}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {(urlPreviewLoading || visibleDetectedUrls.length > 0) && (
+        <div className="px-1 py-1.5">
+          <div className="mb-1.5 flex items-center gap-2">
+            <span className="text-[10px] font-medium uppercase tracking-wider text-gray-500">
+              Detected URLs ({visibleDetectedUrls.length})
+            </span>
+            {urlPreviewLoading && (
+              <span className="flex items-center gap-1 text-[10px] text-cyan-400">
+                <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border-[1.5px] border-cyan-400 border-t-transparent" />
+                Reading
+              </span>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {visibleDetectedUrls.map((preview) => (
+              <UrlChip
+                key={preview.url}
+                preview={preview}
+                statusLabel="Detected"
+                onOpen={() => openUrlDetail(preview.url)}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit} className="flex items-end gap-2">
         {!isCommMode && (
           <FileUploadButton
             onUploaded={handleFileUploaded}
             disabled={isStreaming}
           />
         )}
-        <input
-          type="text"
+        <textarea
+          ref={textareaRef}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
+          onCompositionStart={() => setIsComposing(true)}
+          onCompositionEnd={() => setIsComposing(false)}
+          onKeyDown={handleKeyDown}
           placeholder={placeholder}
           disabled={isCommMode ? commDrafting : isStreaming}
-          className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:opacity-50"
+          rows={1}
+          className="max-h-48 min-h-[48px] flex-1 resize-none overflow-y-auto bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:opacity-50"
         />
         <button
           type="submit"
@@ -440,6 +639,30 @@ export default function PromptInput() {
           {buttonLabel}
         </button>
       </form>
+
+      {detailData && (
+        <UrlDetailModal
+          data={detailData}
+          attachedUrls={[...attachedNormalizedUrls]}
+          onClose={() => setDetailData(null)}
+          onAttach={(selectedUrls) => handleAttachPages(detailData.page.url, selectedUrls)}
+        />
+      )}
+
+      {detailLoadingUrl && (
+        <div className="absolute inset-0 flex items-center justify-center rounded-xl bg-black/20">
+          <div className="rounded-lg border border-gray-700 bg-gray-900/95 px-4 py-2 text-sm text-gray-300">
+            Reading URL...
+          </div>
+        </div>
+      )}
     </div>
   );
+}
+
+function recommendationProviderMatch(selectedModels: string[], provider?: string) {
+  if (!provider) return null;
+  return [...selectedModels]
+    .reverse()
+    .find((modelId) => MODELS[modelId]?.provider === provider) ?? null;
 }

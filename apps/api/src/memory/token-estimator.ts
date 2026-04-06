@@ -1,5 +1,6 @@
-import { CHARS_PER_TOKEN, MODELS, RESPONSE_TOKEN_RESERVE, SYSTEM_TOKEN_RESERVE } from '@prism/shared';
+import { CHARS_PER_TOKEN, RESPONSE_TOKEN_RESERVE, SYSTEM_TOKEN_RESERVE } from '@prism/shared';
 import type { ContextBudget, MessageRole } from '@prism/shared';
+import { modelRegistry } from '../services/model-registry';
 
 /**
  * Estimate token count for a string using character-based heuristic.
@@ -21,7 +22,7 @@ export function estimateMessageTokens(role: MessageRole, content: string): numbe
  * Compute the token budget for a given model.
  */
 export function computeBudget(model: string): ContextBudget {
-  const config = MODELS[model];
+  const config = modelRegistry.getById(model);
   if (!config) throw new Error(`Unknown model: ${model}`);
 
   const maxTokens = config.maxTokens;

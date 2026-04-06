@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { MODELS } from '@prism/shared';
 import { useChatStore } from '@/stores/chat-store';
 import { streamCompare } from '@/lib/api';
@@ -14,12 +14,29 @@ export default function ComparePanel() {
   const [instruction, setInstruction] = useState('');
   const isStreaming = useChatStore((s) => s.isStreaming);
   const sessionId = useChatStore((s) => s.sessionId);
-  const responses = useChatStore((s) => s.responses);
+  const responses = useChatStore((s) => s.compareResponses);
   const compareOriginContent = useChatStore((s) => s.compareOriginContent);
   const compareOriginModel = useChatStore((s) => s.compareOriginModel);
+  const reconcileCompletedResponse = useChatStore((s) => s.reconcileCompletedResponse);
 
   // Use session-active models instead of all MODELS
   const modelIds = selectedModels;
+
+  useEffect(() => {
+    if (!originModel && compareOriginModel) {
+      setOriginModel(compareOriginModel);
+      setCriticModels(modelIds.filter((id) => id !== compareOriginModel));
+    }
+  }, [compareOriginModel, modelIds, originModel]);
+
+  useEffect(() => {
+    for (const [model, resp] of Object.entries(responses)) {
+      if (!resp?.done || !resp.content.trim()) continue;
+      if (resp.streamStatus !== 'stalled' && resp.streamStatus !== 'retrying') continue;
+      if (!['stop', 'STOP', 'end_turn'].includes(resp.stopReason ?? resp.debug?.stopReason ?? '')) continue;
+      reconcileCompletedResponse(model, 'compare');
+    }
+  }, [reconcileCompletedResponse, responses]);
 
   const toggleCritic = (model: string) => {
     setCriticModels((prev) =>
@@ -86,12 +103,12 @@ export default function ComparePanel() {
 
         {!sessionId && (
           <span className="text-xs text-yellow-500">
-            Send a prompt in Parallel mode first to generate responses
+            Start or reopen a shared session first
           </span>
         )}
         {sessionId && modelIds.length < 2 && (
           <span className="text-xs text-yellow-500">
-            Select at least 2 models in Parallel mode to compare
+            Select at least 2 models in this shared session to compare
           </span>
         )}
       </div>
@@ -123,7 +140,7 @@ export default function ComparePanel() {
           <div className="flex-1 min-w-0 bg-gray-900 border border-gray-800 rounded-lg flex flex-col">
             <div className="flex items-center justify-between px-4 py-2 border-b border-gray-800">
               <span className="text-sm font-semibold text-gray-200">{originDisplay}</span>
-              <span className="text-xs text-gray-500">original</span>
+              <span className="text-xs text-gray-500">shared origin</span>
             </div>
             <div className="flex-1 p-4 overflow-auto">
               <MarkdownContent content={compareOriginContent} />
@@ -132,7 +149,9 @@ export default function ComparePanel() {
         )}
 
         {/* Critic responses */}
-        {Object.keys(responses).map((model) => {
+        {Object.keys(responses)
+          .filter((model) => model !== displayOrigin)
+          .map((model) => {
           const resp = responses[model];
           return (
             <ResponsePanel
@@ -141,6 +160,23 @@ export default function ComparePanel() {
               content={resp.content}
               done={resp.done}
               error={resp.error}
+              stopReason={resp.stopReason}
+              modeLabel={resp.mode === 'observer_review' ? 'Review' : 'Compare'}
+              responseMode={resp.mode}
+              streamTarget="compare"
+              sessionId={sessionId ?? undefined}
+              messageId={resp.messageId}
+              streamStatus={resp.streamStatus}
+              retryable={resp.retryable}
+              partialRetained={resp.partialRetained}
+              attempt={resp.attempt}
+              debug={resp.debug}
+              promptTokens={resp.promptTokens}
+              completionTokens={resp.completionTokens}
+              reasoningTokens={resp.reasoningTokens}
+              cachedTokens={resp.cachedTokens}
+              estimatedCostUsd={resp.estimatedCostUsd}
+              pricingSource={resp.pricingSource}
             />
           );
         })}

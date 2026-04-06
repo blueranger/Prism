@@ -2,9 +2,9 @@
 
 import { useState, useRef, useEffect } from 'react';
 import { MODELS, MAX_SELECTED_MODELS } from '@prism/shared';
-import type { LLMProvider, ModelConfig } from '@prism/shared';
+import type { LLMProvider, ModelRegistryInfo } from '@prism/shared';
 import { useChatStore } from '@/stores/chat-store';
-import { fetchModels, type ModelEntry } from '@/lib/api';
+import { fetchModels, refreshModels, type ModelEntry } from '@/lib/api';
 import ThinkingToggle from './ThinkingToggle';
 
 /** Provider display labels */
@@ -24,6 +24,53 @@ interface ModelItem {
   description?: string;
   isReasoning?: boolean;
   supportsThinking?: boolean;
+}
+
+function parseVersionTokens(value: string): number[] {
+  const match = value.match(/(\d+(?:\.\d+){0,2})/);
+  if (!match) return [];
+  return match[1].split('.').map((part) => Number.parseInt(part, 10) || 0);
+}
+
+function compareVersionTokens(a: number[], b: number[]): number {
+  const max = Math.max(a.length, b.length);
+  for (let i = 0; i < max; i += 1) {
+    const diff = (b[i] ?? 0) - (a[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+function variantPriority(modelId: string): number {
+  if (/latest/i.test(modelId)) return 5;
+  if (/-pro(?:-|$)/i.test(modelId)) return 4;
+  if (/\bopus\b/i.test(modelId)) return 4;
+  if (/\bsonnet\b/i.test(modelId)) return 3;
+  if (/\bhaiku\b/i.test(modelId)) return 2;
+  if (/-mini(?:-|$)/i.test(modelId)) return 1;
+  if (/-nano(?:-|$)/i.test(modelId)) return 0;
+  return 3;
+}
+
+function snapshotPenalty(modelId: string): number {
+  if (/\d{4}-\d{2}-\d{2}/.test(modelId)) return 1;
+  if (/\d{8}/.test(modelId)) return 1;
+  return 0;
+}
+
+function sortModels(models: ModelItem[]): ModelItem[] {
+  return [...models].sort((a, b) => {
+    const versionCmp = compareVersionTokens(parseVersionTokens(a.displayName || a.id), parseVersionTokens(b.displayName || b.id));
+    if (versionCmp !== 0) return versionCmp;
+
+    const snapshotCmp = snapshotPenalty(a.id) - snapshotPenalty(b.id);
+    if (snapshotCmp !== 0) return snapshotCmp;
+
+    const variantCmp = variantPriority(b.id) - variantPriority(a.id);
+    if (variantCmp !== 0) return variantCmp;
+
+    return a.displayName.localeCompare(b.displayName);
+  });
 }
 
 function getModelsByProvider(
@@ -62,6 +109,10 @@ function getModelsByProvider(
     }
   }
 
+  for (const provider of Object.keys(grouped)) {
+    grouped[provider] = sortModels(grouped[provider]);
+  }
+
   return grouped as Record<LLMProvider, ModelItem[]>;
 }
 
@@ -73,6 +124,24 @@ function fmtCost(v: number): string {
   return `$${v.toFixed(2)}`;
 }
 
+function formatRefreshInterval(ms: number): string {
+  if (ms === 24 * 60 * 60 * 1000) return 'Every 24h';
+  const hours = Math.round(ms / (60 * 60 * 1000));
+  if (hours >= 1) return `Every ${hours}h`;
+  const minutes = Math.max(1, Math.round(ms / (60 * 1000)));
+  return `Every ${minutes}m`;
+}
+
+function formatLastRefreshed(timestamp: number | null): string {
+  if (!timestamp) return 'Never';
+
+  const diffMs = Date.now() - timestamp;
+  if (diffMs < 60_000) return 'Just now';
+  if (diffMs < 60 * 60 * 1000) return `${Math.floor(diffMs / 60_000)}m ago`;
+  if (diffMs < 24 * 60 * 60 * 1000) return `${Math.floor(diffMs / (60 * 60 * 1000))}h ago`;
+  return new Date(timestamp).toLocaleString();
+}
+
 export default function ModelSelector() {
   const selectedModels = useChatStore((s) => s.selectedModels);
   const toggleModel = useChatStore((s) => s.toggleModel);
@@ -80,13 +149,18 @@ export default function ModelSelector() {
 
   const [open, setOpen] = useState(false);
   const [apiModels, setApiModels] = useState<ModelEntry[] | null>(null);
+  const [registryInfo, setRegistryInfo] = useState<ModelRegistryInfo | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Fetch models from API on first open
   useEffect(() => {
     if (!open || apiModels) return;
     fetchModels().then((resp) => {
-      if (resp?.models) setApiModels(resp.models);
+      if (!resp) return;
+      setApiModels(resp.models);
+      setRegistryInfo(resp.registry);
     });
   }, [open, apiModels]);
 
@@ -112,6 +186,31 @@ export default function ModelSelector() {
       return apiMatch?.displayName ?? MODELS[id]?.displayName ?? id;
     })
     .join(', ');
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    setRefreshError(null);
+    try {
+      const refreshed = await refreshModels();
+      if (!refreshed?.success) {
+        setRefreshError('Refresh failed');
+        return;
+      }
+
+      const latest = await fetchModels();
+      if (!latest) {
+        setRefreshError('Refresh succeeded, but reload failed');
+        return;
+      }
+
+      setApiModels(latest.models);
+      setRegistryInfo(latest.registry);
+    } catch {
+      setRefreshError('Refresh failed');
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   return (
     <div className="relative" ref={panelRef}>
@@ -169,6 +268,26 @@ export default function ModelSelector() {
                 <span className="inline-block w-1.5 h-1.5 rounded-full bg-orange-700" />
                 <span>Out</span>
               </span>
+            </div>
+            <div className="mt-2.5 rounded-md border border-gray-800 bg-gray-950/70 px-2.5 py-2">
+              <div className="flex items-start justify-between gap-3">
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10px] text-gray-500">
+                  <span>Auto refresh: <span className="text-gray-300">{registryInfo?.autoRefreshEnabled ? 'Enabled' : 'Disabled'}</span></span>
+                  <span>Interval: <span className="text-gray-300">{formatRefreshInterval(registryInfo?.refreshIntervalMs ?? 24 * 60 * 60 * 1000)}</span></span>
+                  <span>Last refresh: <span className="text-gray-300">{formatLastRefreshed(registryInfo?.lastRefreshedAt ?? null)}</span></span>
+                  <span>Discovered models: <span className="text-gray-300">{registryInfo?.discoveredCount ?? 0}</span></span>
+                </div>
+                <button
+                  onClick={handleRefresh}
+                  disabled={refreshing}
+                  className="flex-shrink-0 rounded-md border border-gray-700 px-2 py-1 text-[10px] font-medium text-gray-300 hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {refreshing ? 'Refreshing...' : 'Refresh now'}
+                </button>
+              </div>
+              {refreshError && (
+                <div className="mt-2 text-[10px] text-red-400">{refreshError}</div>
+              )}
             </div>
           </div>
 

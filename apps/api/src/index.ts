@@ -15,6 +15,7 @@ import modelsRouter from './routes/models';
 import handoffRouter from './routes/handoff';
 import compareRouter from './routes/compare';
 import synthesizeRouter from './routes/synthesize';
+import observerRouter from './routes/observer';
 import sessionsRouter from './routes/sessions';
 import agentsRouter from './routes/agents';
 import decisionsRouter from './routes/decisions';
@@ -25,11 +26,19 @@ import webhooksRouter from './routes/webhooks';
 import importRouter from './routes/import';
 import searchRouter from './routes/search';
 import knowledgeRouter from './routes/knowledge';
+import memoryRouter from './routes/memory';
+import triggersRouter from './routes/triggers';
+import notificationsRouter from './routes/notifications';
+import costsRouter from './routes/costs';
 import outlinesRouter from './routes/outlines';
 import provenanceRouter from './routes/provenance';
 import notionRouter from './routes/notion';
+import obsidianRouter from './routes/obsidian';
+import compilerRouter from './routes/compiler';
+import wikiRouter from './routes/wiki';
 import filesRouter from './routes/files';
 import ragRouter from './routes/rag';
+import webContextRouter from './routes/web-context';
 
 // Import agents to trigger self-registration
 import './agents';
@@ -63,13 +72,14 @@ const app = express();
 const server = http.createServer(app);
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 
 app.use('/api/prompt', promptRouter);
 app.use('/api/models', modelsRouter);
 app.use('/api/handoff', handoffRouter);
 app.use('/api/compare', compareRouter);
 app.use('/api/synthesize', synthesizeRouter);
+app.use('/api/observer', observerRouter);
 app.use('/api/sessions', sessionsRouter);
 app.use('/api/agents', agentsRouter);
 app.use('/api/decisions', decisionsRouter);
@@ -80,11 +90,19 @@ app.use('/api/webhooks', webhooksRouter);
 app.use('/api/import', importRouter);
 app.use('/api/search', searchRouter);
 app.use('/api/knowledge', knowledgeRouter);
+app.use('/api/memory', memoryRouter);
+app.use('/api/triggers', triggersRouter);
+app.use('/api/notifications', notificationsRouter);
+app.use('/api/costs', costsRouter);
 app.use('/api/outlines', outlinesRouter);
 app.use('/api/provenance', provenanceRouter);
 app.use('/api/notion', notionRouter);
+app.use('/api/obsidian', obsidianRouter);
+app.use('/api/compiler', compilerRouter);
+app.use('/api/wiki', wikiRouter);
 app.use('/api/files', filesRouter);
 app.use('/api/rag', ragRouter);
+app.use('/api/web-context', webContextRouter);
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });

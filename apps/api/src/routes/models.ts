@@ -4,7 +4,8 @@ import { modelRegistry } from '../services/model-registry';
 const router = Router();
 
 /** GET /api/models — returns all available models with pricing info */
-router.get('/', (_req, res) => {
+router.get('/', async (_req, res) => {
+  await modelRegistry.ensureInitialized();
   const all = modelRegistry.getAll();
   const models = Object.entries(all).map(([id, config]) => ({
     id,

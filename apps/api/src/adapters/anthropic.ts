@@ -44,12 +44,24 @@ export class AnthropicAdapter extends LLMAdapter {
       }
 
       const stream = this.getClient().messages.stream(params as any);
+      let stopReason: string | undefined;
+      let chunkCount = 0;
+      let contentChars = 0;
+      let thinkingChars = 0;
 
       for await (const event of stream) {
+        chunkCount += 1;
+        if (event.type === 'message_delta') {
+          const delta = (event as any).delta;
+          if (delta?.stop_reason) {
+            stopReason = String(delta.stop_reason);
+          }
+        }
         if (event.type === 'content_block_delta') {
           const delta = event.delta as any;
 
           if (delta.type === 'thinking_delta' && delta.thinking) {
+            thinkingChars += String(delta.thinking).length;
             // Extended thinking content
             yield {
               provider: this.provider,
@@ -59,6 +71,7 @@ export class AnthropicAdapter extends LLMAdapter {
               thinkingContent: delta.thinking,
             };
           } else if (delta.type === 'text_delta') {
+            contentChars += String(delta.text).length;
             // Regular response content
             yield {
               provider: this.provider,
@@ -71,17 +84,27 @@ export class AnthropicAdapter extends LLMAdapter {
       }
 
       const finalMessage = await stream.finalMessage();
+      console.log(`[anthropic] Stream finished for ${request.model}`, {
+        chunkCount,
+        contentChars,
+        thinkingChars,
+        stopReason: stopReason ?? (finalMessage as any).stop_reason ?? undefined,
+      });
       yield {
         provider: this.provider,
         model: request.model,
         content: '',
         done: true,
+        stopReason: stopReason ?? (finalMessage as any).stop_reason ?? undefined,
         usage: {
           promptTokens: finalMessage.usage.input_tokens,
           completionTokens: finalMessage.usage.output_tokens,
         },
       };
     } catch (err: any) {
+      console.error(`[anthropic] Stream failed for ${request.model}`, {
+        error: err.message ?? 'Anthropic request failed',
+      });
       yield {
         provider: this.provider,
         model: request.model,

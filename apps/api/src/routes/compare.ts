@@ -1,11 +1,28 @@
 import { Router, Request, Response } from 'express';
-import { CompareRequest, MODELS } from '@prism/shared';
-import { streamSingle, interleaveStreams, type ChatMessage } from '../services/llm-service';
+import { CompareRequest, ContextDebugInfo } from '@prism/shared';
+import { streamSingleWithTimeout, interleaveStreams, type ChatMessage } from '../services/llm-service';
 import { saveMessage, getSessionMessages } from '../memory/conversation';
 import { buildSessionContext } from '../memory/context-builder';
 import { setupSSE, sseWrite } from './sse-utils';
+import { modelRegistry } from '../services/model-registry';
+import { runMemoryPipelineForMessage } from '../services/memory-trigger-pipeline';
+import { computeUsageEvent, recordUsageEvent } from '../services/cost-service';
 
 const router = Router();
+const LONG_FORM_OUTPUT_MAX_TOKENS = 8192;
+
+function buildStructuredContinuationPrompt(partialOutput: string, evalInstruction: string): string {
+  const tail = partialOutput.trim().slice(-1600);
+  return [
+    'Continue your previous structured critique or artifact from where it stopped.',
+    'Do not restart the document, do not repeat earlier sections, and do not add a new introduction or explanation.',
+    `Original task: ${evalInstruction}`,
+    'Resume from the last unfinished block or line and finish the artifact cleanly.',
+    '',
+    'Tail of the partial output to continue from:',
+    tail,
+  ].join('\n');
+}
 
 /**
  * POST /api/compare/stream
@@ -24,11 +41,13 @@ router.post('/stream', async (req: Request, res: Response) => {
   }
 
   for (const model of [originModel, ...criticModels]) {
-    if (!MODELS[model]) {
+    if (!modelRegistry.getById(model)) {
       res.status(400).json({ error: `Unknown model: ${model}` });
       return;
     }
   }
+
+  const originConfig = modelRegistry.getById(originModel);
 
   // Find the origin model's latest assistant response in this session
   const messages = getSessionMessages(sessionId);
@@ -37,12 +56,12 @@ router.post('/stream', async (req: Request, res: Response) => {
   );
 
   if (originResponses.length === 0) {
-    res.status(400).json({ error: `No response from ${MODELS[originModel].displayName} found in this session` });
+    res.status(400).json({ error: `No response from ${originConfig?.displayName ?? originModel} found in this session` });
     return;
   }
 
   const latestOriginResponse = originResponses[originResponses.length - 1];
-  const originDisplay = MODELS[originModel].displayName;
+  const originDisplay = originConfig?.displayName ?? originModel;
 
   // Set up SSE
   setupSSE(res);
@@ -55,13 +74,26 @@ router.post('/stream', async (req: Request, res: Response) => {
     criticModels,
   }));
 
+  const contextDebugByModel: Record<string, ContextDebugInfo> = {};
+
   // Build evaluation prompt for each critic
   const evalInstruction = instruction
     ?? 'Evaluate the following response. Identify strengths, weaknesses, factual errors, and areas for improvement. Be specific and constructive.';
 
+  const requestMessagesByModel: Record<string, ChatMessage[]> = {};
   const criticStreams = criticModels.map((criticModel) => {
     // Build context for the critic model (token-budget-aware)
     const ctx = buildSessionContext(sessionId, criticModel);
+    contextDebugByModel[criticModel] = {
+      model: criticModel,
+      budget: { maxTokens: 0, reserveForResponse: 0, reserveForSystem: 0, available: 0 },
+      contextTokens: ctx.tokenEstimate,
+      promptTokens: evalInstruction.length + latestOriginResponse.content.length,
+      totalTokens: ctx.tokenEstimate + evalInstruction.length + latestOriginResponse.content.length,
+      breakdown: ctx.breakdown,
+      documents: ctx.documents,
+      memoryInjection: ctx.memoryInjection ?? null,
+    };
 
     const criticMessages: ChatMessage[] = [
       ...ctx.messages,
@@ -78,20 +110,62 @@ router.post('/stream', async (req: Request, res: Response) => {
         ].join('\n'),
       },
     ];
+    requestMessagesByModel[criticModel] = criticMessages;
 
-    return streamSingle(criticModel, criticMessages);
+    return streamSingleWithTimeout(criticModel, criticMessages, undefined, { maxTokens: LONG_FORM_OUTPUT_MAX_TOKENS });
   });
+
+  sseWrite(res, JSON.stringify({ type: 'context_debug', sessionId, byModel: contextDebugByModel }));
 
   // Stream all critiques interleaved
   const accumulated: Record<string, string> = {};
+  const thinkingAccumulated: Record<string, string> = {};
+  const usageMetaByModel: Record<string, ReturnType<typeof computeUsageEvent>> = {};
+  const streamStartedAt = Date.now();
 
   try {
     for await (const chunk of interleaveStreams(criticStreams)) {
       const key = chunk.model;
       if (!accumulated[key]) accumulated[key] = '';
+      if (!thinkingAccumulated[key]) thinkingAccumulated[key] = '';
       accumulated[key] += chunk.content;
+      if (chunk.thinkingContent) {
+        thinkingAccumulated[key] += chunk.thinkingContent;
+      }
+      let outboundChunk = chunk;
+      if (chunk.done) {
+        const computed = computeUsageEvent({
+          sessionId,
+          provider: chunk.provider,
+          model: key,
+          mode: 'compare',
+          startedAt: streamStartedAt,
+          completedAt: Date.now(),
+          requestMessages: requestMessagesByModel[key],
+          content: accumulated[key],
+          thinkingContent: thinkingAccumulated[key],
+          usage: chunk.usage,
+        });
+        usageMetaByModel[key] = computed;
+        outboundChunk = {
+          ...chunk,
+          usage: {
+            ...chunk.usage,
+            promptTokens: computed.promptTokens,
+            completionTokens: computed.completionTokens,
+            reasoningTokens: computed.reasoningTokens,
+            cachedTokens: computed.cachedTokens,
+            totalTokens: computed.totalTokens,
+          },
+          estimatedCostUsd: computed.estimatedCostUsd,
+          pricingSource: computed.pricingSource,
+        };
+      }
 
-      sseWrite(res, JSON.stringify(chunk));
+      if ((chunk as any).timeoutReason) {
+        sseWrite(res, JSON.stringify({ type: 'stream_timeout', model: chunk.model, reason: (chunk as any).timeoutReason }));
+      }
+      sseWrite(res, JSON.stringify(outboundChunk));
     }
   } catch (err: any) {
     sseWrite(res, JSON.stringify({ error: err.message }));
@@ -100,7 +174,45 @@ router.post('/stream', async (req: Request, res: Response) => {
   // Save critic responses (tagged as compare mode)
   for (const [model, content] of Object.entries(accumulated)) {
     if (content) {
-      saveMessage(sessionId, 'assistant', content, model, { mode: 'compare' });
+      const usage = usageMetaByModel[model];
+      const provider = modelRegistry.getById(model)?.provider ?? 'openai';
+      const assistantMessage = saveMessage(sessionId, 'assistant', content, model, {
+        mode: 'compare',
+        usage: usage ? {
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+          reasoningTokens: usage.reasoningTokens,
+          cachedTokens: usage.cachedTokens,
+        } : undefined,
+        estimatedCostUsd: usage?.estimatedCostUsd,
+        pricingSource: usage?.pricingSource,
+      });
+      recordUsageEvent({
+        sessionId,
+        messageId: assistantMessage.id,
+        provider,
+        model,
+        mode: 'compare',
+        startedAt: streamStartedAt,
+        completedAt: Date.now(),
+        requestMessages: requestMessagesByModel[model],
+        content,
+        thinkingContent: thinkingAccumulated[model],
+        usage: usage ? {
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+          reasoningTokens: usage.reasoningTokens,
+          cachedTokens: usage.cachedTokens,
+          totalTokens: usage.totalTokens,
+        } : undefined,
+      });
+      void Promise.resolve().then(() => {
+        try {
+          runMemoryPipelineForMessage(sessionId, assistantMessage.id, 'auto_post_response');
+        } catch (err: any) {
+          console.warn('[compare/stream] Memory pipeline failed for assistant message:', err.message);
+        }
+      });
     }
   }
 
@@ -112,6 +224,187 @@ router.post('/stream', async (req: Request, res: Response) => {
       console.warn(`[compare/stream] RAG session indexing failed (non-critical):`, err.message);
     });
   }).catch(() => {});
+
+  sseWrite(res, '[DONE]');
+  res.end();
+});
+
+router.post('/retry-stream', async (req: Request, res: Response) => {
+  const {
+    sessionId,
+    originModel,
+    criticModels,
+    instruction,
+    continuationFrom,
+    richOutput,
+  }: CompareRequest & { continuationFrom?: string; richOutput?: boolean } = req.body;
+
+  if (!sessionId || !originModel || !criticModels || criticModels.length === 0) {
+    res.status(400).json({ error: 'sessionId, originModel, and criticModels[] are required' });
+    return;
+  }
+
+  for (const model of [originModel, ...criticModels]) {
+    if (!modelRegistry.getById(model)) {
+      res.status(400).json({ error: `Unknown model: ${model}` });
+      return;
+    }
+  }
+
+  const originConfig = modelRegistry.getById(originModel);
+  const originDisplay = originConfig?.displayName ?? originModel;
+  const messages = getSessionMessages(sessionId);
+  const originResponses = messages.filter((m) => m.role === 'assistant' && m.sourceModel === originModel);
+
+  if (originResponses.length === 0) {
+    res.status(400).json({ error: `No response from ${originDisplay} found in this session` });
+    return;
+  }
+
+  const latestOriginResponse = originResponses[originResponses.length - 1];
+  const evalInstruction = instruction
+    ?? 'Evaluate the following response. Identify strengths, weaknesses, factual errors, and areas for improvement. Be specific and constructive.';
+
+  setupSSE(res);
+  sseWrite(res, JSON.stringify({
+    type: 'compare_start',
+    originModel,
+    originContent: latestOriginResponse.content,
+    criticModels,
+  }));
+
+  const accumulated: Record<string, string> = {};
+  const thinkingAccumulated: Record<string, string> = {};
+  const usageMetaByModel: Record<string, ReturnType<typeof computeUsageEvent>> = {};
+  const contextDebugByModel: Record<string, ContextDebugInfo> = {};
+  const requestMessagesByModel: Record<string, ChatMessage[]> = {};
+  const streamStartedAt = Date.now();
+
+  try {
+    for (const criticModel of criticModels) {
+      const ctx = buildSessionContext(sessionId, criticModel);
+      contextDebugByModel[criticModel] = {
+        model: criticModel,
+        budget: { maxTokens: 0, reserveForResponse: 0, reserveForSystem: 0, available: 0 },
+        contextTokens: ctx.tokenEstimate,
+        promptTokens: evalInstruction.length + latestOriginResponse.content.length,
+        totalTokens: ctx.tokenEstimate + evalInstruction.length + latestOriginResponse.content.length,
+        breakdown: ctx.breakdown,
+        documents: ctx.documents,
+        memoryInjection: ctx.memoryInjection ?? null,
+      };
+      const userPrompt = richOutput && continuationFrom?.trim()
+        ? buildStructuredContinuationPrompt(continuationFrom, evalInstruction)
+        : [
+            `The following response was generated by ${originDisplay}:`,
+            '',
+            '---',
+            latestOriginResponse.content,
+            '---',
+            '',
+            evalInstruction,
+          ].join('\n');
+      const criticMessages: ChatMessage[] = [
+        ...ctx.messages,
+        { role: 'user', content: userPrompt },
+      ];
+      requestMessagesByModel[criticModel] = criticMessages;
+
+      if (Object.keys(contextDebugByModel).length === 1) {
+        sseWrite(res, JSON.stringify({ type: 'context_debug', sessionId, byModel: contextDebugByModel }));
+      }
+
+      for await (const chunk of streamSingleWithTimeout(criticModel, criticMessages, undefined, {
+        maxTokens: richOutput ? LONG_FORM_OUTPUT_MAX_TOKENS : undefined,
+      })) {
+        if (!accumulated[criticModel]) accumulated[criticModel] = '';
+        if (!thinkingAccumulated[criticModel]) thinkingAccumulated[criticModel] = '';
+        accumulated[criticModel] += chunk.content;
+        if (chunk.thinkingContent) {
+          thinkingAccumulated[criticModel] += chunk.thinkingContent;
+        }
+        let outboundChunk = chunk;
+        if (chunk.done) {
+          const computed = computeUsageEvent({
+            sessionId,
+            provider: chunk.provider,
+            model: criticModel,
+            mode: 'compare',
+            startedAt: streamStartedAt,
+            completedAt: Date.now(),
+            requestMessages: criticMessages,
+            content: accumulated[criticModel],
+            thinkingContent: thinkingAccumulated[criticModel],
+            usage: chunk.usage,
+          });
+          usageMetaByModel[criticModel] = computed;
+          outboundChunk = {
+            ...chunk,
+            usage: {
+              ...chunk.usage,
+              promptTokens: computed.promptTokens,
+              completionTokens: computed.completionTokens,
+              reasoningTokens: computed.reasoningTokens,
+              cachedTokens: computed.cachedTokens,
+              totalTokens: computed.totalTokens,
+            },
+            estimatedCostUsd: computed.estimatedCostUsd,
+            pricingSource: computed.pricingSource,
+          };
+        }
+        if ((chunk as any).timeoutReason) {
+          sseWrite(res, JSON.stringify({ type: 'stream_timeout', model: criticModel, reason: (chunk as any).timeoutReason }));
+        }
+        sseWrite(res, JSON.stringify(outboundChunk));
+      }
+    }
+  } catch (err: any) {
+    sseWrite(res, JSON.stringify({ error: err.message }));
+  }
+
+  for (const [model, content] of Object.entries(accumulated)) {
+    if (content) {
+      const usage = usageMetaByModel[model];
+      const provider = modelRegistry.getById(model)?.provider ?? 'openai';
+      const assistantMessage = saveMessage(sessionId, 'assistant', content, model, {
+        mode: 'compare',
+        usage: usage ? {
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+          reasoningTokens: usage.reasoningTokens,
+          cachedTokens: usage.cachedTokens,
+        } : undefined,
+        estimatedCostUsd: usage?.estimatedCostUsd,
+        pricingSource: usage?.pricingSource,
+      });
+      recordUsageEvent({
+        sessionId,
+        messageId: assistantMessage.id,
+        provider,
+        model,
+        mode: 'compare',
+        startedAt: streamStartedAt,
+        completedAt: Date.now(),
+        requestMessages: requestMessagesByModel[model],
+        content,
+        thinkingContent: thinkingAccumulated[model],
+        usage: usage ? {
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+          reasoningTokens: usage.reasoningTokens,
+          cachedTokens: usage.cachedTokens,
+          totalTokens: usage.totalTokens,
+        } : undefined,
+      });
+      void Promise.resolve().then(() => {
+        try {
+          runMemoryPipelineForMessage(sessionId, assistantMessage.id, 'auto_post_response');
+        } catch (err: any) {
+          console.warn('[compare/retry-stream] Memory pipeline failed for assistant message:', err.message);
+        }
+      });
+    }
+  }
 
   sseWrite(res, '[DONE]');
   res.end();

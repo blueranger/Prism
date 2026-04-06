@@ -52,8 +52,13 @@ export class GoogleAdapter extends LLMAdapter {
       });
 
       const result = await chat.sendMessageStream(lastMessage.content);
+      let stopReason: string | undefined;
+      let chunkCount = 0;
+      let contentChars = 0;
+      let thinkingChars = 0;
 
       for await (const chunk of result.stream) {
+        chunkCount += 1;
         // Access candidate parts to distinguish thinking vs response content
         const candidate = (chunk as any).candidates?.[0];
         const parts = candidate?.content?.parts;
@@ -61,6 +66,7 @@ export class GoogleAdapter extends LLMAdapter {
         if (parts && Array.isArray(parts)) {
           for (const part of parts) {
             if (part.thought && part.text) {
+              thinkingChars += String(part.text).length;
               // Thinking content (part has thought: true flag)
               yield {
                 provider: this.provider,
@@ -70,6 +76,7 @@ export class GoogleAdapter extends LLMAdapter {
                 thinkingContent: part.text,
               };
             } else if (part.text) {
+              contentChars += String(part.text).length;
               // Regular response content
               yield {
                 provider: this.provider,
@@ -83,6 +90,7 @@ export class GoogleAdapter extends LLMAdapter {
           // Fallback: use chunk.text() for non-thinking responses
           const text = chunk.text();
           if (text) {
+            contentChars += String(text).length;
             yield {
               provider: this.provider,
               model: request.model,
@@ -93,13 +101,33 @@ export class GoogleAdapter extends LLMAdapter {
         }
       }
 
+      try {
+        const finalResponse = await result.response;
+        stopReason = (finalResponse as any)?.candidates?.[0]?.finishReason
+          ?? (finalResponse as any)?.candidates?.[0]?.finish_reason
+          ?? undefined;
+      } catch {
+        // Ignore final response metadata failure; streaming content already arrived.
+      }
+
+      console.log(`[google] Stream finished for ${request.model}`, {
+        chunkCount,
+        contentChars,
+        thinkingChars,
+        stopReason,
+      });
+
       yield {
         provider: this.provider,
         model: request.model,
         content: '',
         done: true,
+        stopReason,
       };
     } catch (err: any) {
+      console.error(`[google] Stream failed for ${request.model}`, {
+        error: err.message ?? 'Google AI request failed',
+      });
       yield {
         provider: this.provider,
         model: request.model,

@@ -158,7 +158,7 @@ export default function ProvenanceView() {
   // Handle jump to source
   const handleJumpToSource = useCallback((record: ProvenanceRecord) => {
     if (record.sourceType === 'native' && record.sessionId) {
-      useChatStore.getState().setMode('parallel');
+      useChatStore.getState().setMode('observer');
       // Optionally restore session
       // useChatStore.getState().selectSession(record.sessionId);
     } else if (record.sourceType === 'imported' && record.conversationId) {

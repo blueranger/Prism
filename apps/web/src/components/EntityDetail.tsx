@@ -34,7 +34,7 @@ export default function EntityDetail() {
       selectLibraryConversation(m.conversationId);
     } else if (m.source === 'native' && m.sessionId) {
       // Navigate to the native Prism session
-      setMode('parallel');
+      setMode('observer');
       switchSession(m.sessionId);
     }
   }, [setMode, selectLibraryConversation, switchSession]);

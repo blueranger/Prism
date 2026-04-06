@@ -145,6 +145,15 @@ MICROSOFT_REDIRECT_URI=http://localhost:3001/api/connectors/outlook/callback
 
 You may also need additional connector-specific variables, depending on which integrations you use.
 
+Optional model discovery settings:
+
+```env
+MODEL_DISCOVERY_ENABLED=true
+MODEL_DISCOVERY_INTERVAL_MS=86400000
+```
+
+This enables automatic model registry refresh once per day.
+
 ### 3. Start the app
 
 From the repo root:
@@ -199,6 +208,32 @@ Prism currently includes support for:
 - manual/local threads
 
 Some connectors are production-shaped, while others are more local-first or workflow-specific. This repo should be treated as an actively evolving system rather than a polished SaaS product.
+
+## Model Discovery
+
+Prism supports dynamic model discovery for provider-backed model registries.
+
+- OpenAI models are discovered from the OpenAI models API
+- Google Gemini models are discovered from the Google models API
+- Anthropic models are discovered from the Anthropic models API
+
+The static registry in `packages/shared` remains the source of truth for pricing, descriptions, and curated defaults. Dynamic discovery is used to:
+
+- detect newly available models
+- expose provider availability at runtime
+- surface discovered models in the model selector
+
+Auto refresh is optional and controlled by environment variables:
+
+```env
+MODEL_DISCOVERY_ENABLED=true
+MODEL_DISCOVERY_INTERVAL_MS=86400000
+```
+
+Recommended setting:
+
+- enable discovery in environments where provider credentials are available
+- keep the interval at `86400000` for daily refresh
 
 ## Notes on Local State
 

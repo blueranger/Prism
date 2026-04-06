@@ -97,6 +97,21 @@ export function deleteNotionPage(id: string): void {
   db.prepare('DELETE FROM notion_pages WHERE id = ?').run(id);
 }
 
+export function pruneNotionPagesForAccount(accountId: string, notionPageIds: string[]): void {
+  const db = getDb();
+  if (notionPageIds.length === 0) {
+    db.prepare('DELETE FROM notion_pages WHERE account_id = ?').run(accountId);
+    return;
+  }
+
+  const placeholders = notionPageIds.map(() => '?').join(', ');
+  db.prepare(
+    `DELETE FROM notion_pages
+     WHERE account_id = ?
+       AND notion_page_id NOT IN (${placeholders})`
+  ).run(accountId, ...notionPageIds);
+}
+
 function rowToNotionPage(row: any): NotionPageRef {
   return {
     id: row.id,
@@ -117,7 +132,7 @@ function rowToNotionPage(row: any): NotionPageRef {
 
 export function addContextSource(
   sessionId: string,
-  sourceType: 'notion_page',
+  sourceType: 'notion_page' | 'web_page',
   sourceId: string,
   sourceLabel: string,
   attachedBy: 'user' | 'auto' = 'user'
@@ -128,8 +143,8 @@ export function addContextSource(
 
   // Check if already attached
   const existing = db.prepare(
-    'SELECT id FROM context_sources WHERE session_id = ? AND source_id = ?'
-  ).get(sessionId, sourceId) as { id: string } | undefined;
+    'SELECT id FROM context_sources WHERE session_id = ? AND source_type = ? AND source_id = ?'
+  ).get(sessionId, sourceType, sourceId) as { id: string } | undefined;
 
   if (existing) {
     const row = db.prepare('SELECT * FROM context_sources WHERE id = ?').get(existing.id) as any;

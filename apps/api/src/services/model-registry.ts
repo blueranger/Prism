@@ -9,6 +9,39 @@ import { MODELS } from '@prism/shared';
 import type { ModelConfig, DiscoveredModel, ModelRegistryInfo, LLMProvider } from '@prism/shared';
 import { discoverAllModels } from './model-discovery';
 
+const DEFAULT_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+function isAutoRefreshEnabled(): boolean {
+  return process.env.MODEL_DISCOVERY_ENABLED === 'true';
+}
+
+function getRefreshIntervalMs(): number {
+  const raw = parseInt(process.env.MODEL_DISCOVERY_INTERVAL_MS ?? '', 10);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return DEFAULT_REFRESH_INTERVAL_MS;
+  }
+  return raw;
+}
+
+function inferDiscoveredCapabilities(modelId: string, provider: LLMProvider): Pick<ModelConfig, 'isReasoning' | 'supportsThinking'> {
+  if (provider === 'openai') {
+    if (modelId.startsWith('gpt-5') || /^o[1345](?:-|$)/.test(modelId)) {
+      return { isReasoning: true, supportsThinking: true };
+    }
+  }
+
+  if (provider === 'google') {
+    if (/^gemini-(?:2\.5|3)/.test(modelId)) {
+      return { isReasoning: false, supportsThinking: true };
+    }
+  }
+
+  return {
+    isReasoning: undefined,
+    supportsThinking: undefined,
+  };
+}
+
 class ModelRegistryService {
   /** Merged model map (static + discovered) */
   private models: Record<string, ModelConfig>;
@@ -21,6 +54,7 @@ class ModelRegistryService {
 
   /** Whether a refresh is currently running */
   private refreshing = false;
+  private initPromise: Promise<{ added: number; total: number }> | null = null;
 
   constructor() {
     // Deep-clone static config as our base
@@ -53,7 +87,26 @@ class ModelRegistryService {
       staticCount: Object.keys(this.models).length,
       discoveredCount: Object.keys(this.discoveredExtras).length,
       lastRefreshedAt: this.lastRefreshedAt,
+      autoRefreshEnabled: isAutoRefreshEnabled(),
+      refreshIntervalMs: getRefreshIntervalMs(),
     };
+  }
+
+  /** Ensure runtime-discovered models are loaded at least once. */
+  async ensureInitialized(): Promise<void> {
+    if (this.lastRefreshedAt) return;
+    if (!this.initPromise) {
+      this.initPromise = this.refresh()
+        .catch((err) => {
+          console.warn('[model-registry] Initial bootstrap refresh failed:', err);
+          return { added: 0, total: Object.keys(this.getAll()).length };
+        })
+        .finally(() => {
+          this.initPromise = null;
+        });
+    }
+
+    await this.initPromise;
   }
 
   /**
@@ -76,6 +129,7 @@ class ModelRegistryService {
       for (const d of discovered) {
         // Skip if already in static config (static has better metadata)
         if (this.models[d.model]) continue;
+        const inferred = inferDiscoveredCapabilities(d.model, d.provider);
 
         // Create a ModelConfig from the discovered data
         newExtras[d.model] = {
@@ -86,8 +140,8 @@ class ModelRegistryService {
           inputCostPer1M: d.inputCostPer1M ?? 0,
           outputCostPer1M: d.outputCostPer1M ?? 0,
           description: d.description ?? 'Discovered via API',
-          isReasoning: d.isReasoning,
-          supportsThinking: d.isReasoning, // Discovered reasoning models likely support thinking
+          isReasoning: d.isReasoning ?? inferred.isReasoning,
+          supportsThinking: inferred.supportsThinking ?? d.isReasoning,
         };
       }
 
